@@ -1,3 +1,5 @@
 """Dataset components for the TransFusion KITTI project."""
 
-__all__ = []
+from .transforms import ValidateKittiCalibration
+
+__all__ = ['ValidateKittiCalibration']
