@@ -67,9 +67,6 @@ projects/TransFusionKITTI/
 │   ├── datasets/
 │       ├── __init__.py
 │       └── transforms.py
-│   └── evaluation/
-│       ├── __init__.py
-│       └── transfusion_kitti_metric.py
 ├── tools/
 │   ├── convert_kitti_2d_to_coco.py
 │   └── merge_pretrained_weights.py
@@ -201,7 +198,7 @@ homography_matrix
 - 支持 batch size 大于 1，不保留原版只允许 batch size 1 的断言。
 - 默认保持 TransFusion 的 NMS-free 输出；配置保留可选 rotated NMS，仅用于诊断，不进入默认基线。
 - 使用现代 `KittiMetric` 计算 validation `AP_R40 3D`。
-- 项目评估器在保留 `KittiMetric` 原始结果的同时，额外输出三类 `AP_R40 3D Moderate` 均值，供 checkpoint hook 选择 best checkpoint。
+- checkpoint hook 直接使用 `KittiMetric` 已输出的 `pred_instances_3d/KITTI/Overall_3D_AP40_moderate`，该指标即三类 strict `AP_R40 3D Moderate` 均值。
 - 主表报告三类 Easy、Moderate、Hard，论文重点分析 Pedestrian 和 Cyclist，Car 作为辅助约束。
 - 保存 KITTI 格式预测结果，便于定性可视化和后续 test server 扩展，但本阶段不要求提交 test server。
 
