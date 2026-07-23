@@ -13,8 +13,9 @@ MMDetection3D 的模型结构，也没有使用 BEVFusion 的 LSS/BEV 图像融�
 checkpoint 保存及完整 KITTI AP40 评估均已运行；Stage 0 图像分支的
 64 样本短训练及 checkpoint 保存也已运行。TransFusion-LC 已完成正确加载
 LiDAR/image 预训练权重后的单样本前反向、FP32 64 个唯一样本短训练及
-checkpoint 保存；完整 validation 和正式全量训练精度仍待服务器验证。
-完成这些验证前，不能把完整多模态基线写成“已跑通”或“已验证有效”。
+checkpoint 保存，并在 3769 个 KITTI validation 样本上完成完整 AP11/AP40
+评估。因此，现代框架迁移和 KITTI 多模态数据流已经跑通；正式全量训练精度
+仍待验证，不能把当前冒烟结果写成“多模态方法已验证有效”。
 
 ## Environment check
 
@@ -246,4 +247,5 @@ python tools/train.py \
     train_dataloader.dataset.dataset.indices=64
 ```
 
-全部通过后，再运行一次完整 validation；在此之前不要启动三次正式长训练。
+全部通过后，再运行一次完整 validation。冒烟 checkpoint 的指标只用于验证
+评估链路，不进入论文结果；完整 validation 通过后才开始正式全量训练。

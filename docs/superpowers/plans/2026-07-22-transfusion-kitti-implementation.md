@@ -1418,7 +1418,7 @@ Verified on H800: LC loaded the merged LiDAR/image checkpoint without sparse
 encoder shape mismatches, completed 128 iterations over 64 unique samples with
 `RepeatDataset(times=2)`, and saved `epoch_1.pth` using FP32.
 
-- [ ] **Step 5: Run validation metric**
+- [x] **Step 5: Run validation metric**
 
 ```bash
 python tools/test.py \
@@ -1428,6 +1428,10 @@ python tools/test.py \
 
 Expected: `KittiMetric` prints bbox, BEV and 3D AP11/AP40, including `Kitti metric/pred_instances_3d/KITTI/Overall_3D_AP40_moderate`.
 
-- [ ] **Step 6: Mark baseline status accurately**
+Verified on H800: inference completed for all 3769 validation samples and
+printed the full KITTI bbox/BEV/3D AP11 and AP40 metric set. The near-zero AP
+from the 64-sample smoke checkpoint is excluded from research conclusions.
+
+- [x] **Step 6: Mark baseline status accurately**
 
 After these checks, documentation may state “框架迁移和 KITTI 数据流已跑通”. It must not state “多模态方法已验证有效” until complete L/LC experiments and repeated runs support that conclusion.
