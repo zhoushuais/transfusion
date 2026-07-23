@@ -75,6 +75,9 @@ def test_merge_preserves_and_remaps_state_dict_metadata(tmp_path: Path):
         'module.middle_encoder.conv_input': {
             'version': 2
         },
+        'module.middle_encoder.conv_input.0': {
+            'version': 2
+        },
     })
     image_state = OrderedDict({
         'module.backbone.conv.weight': torch.full((1, ), 2.0),
@@ -100,6 +103,7 @@ def test_merge_preserves_and_remaps_state_dict_metadata(tmp_path: Path):
     assert isinstance(saved_state, OrderedDict)
     assert saved_state._metadata['middle_encoder']['version'] == 2
     assert saved_state._metadata['middle_encoder.conv_input']['version'] == 2
+    assert saved_state._metadata['middle_encoder.conv_input.0']['version'] == 2
     assert saved_state._metadata['img_backbone']['version'] == 3
     assert saved_state._metadata['img_backbone.conv']['version'] == 4
     assert saved_state._metadata['img_neck']['version'] == 5

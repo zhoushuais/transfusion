@@ -36,6 +36,9 @@ def test_strip_module_prefix_preserves_spconv_metadata():
         'module.middle_encoder.conv_input': {
             'version': 2
         },
+        'module.middle_encoder.conv_input.0': {
+            'version': 2
+        },
     })
 
     stripped = merge_module._strip_module_prefix(state)
@@ -44,6 +47,7 @@ def test_strip_module_prefix_preserves_spconv_metadata():
     assert list(stripped) == ['middle_encoder.conv_input.0.weight']
     assert stripped._metadata['middle_encoder']['version'] == 2
     assert stripped._metadata['middle_encoder.conv_input']['version'] == 2
+    assert stripped._metadata['middle_encoder.conv_input.0']['version'] == 2
 
 
 def test_merge_image_metadata_remaps_backbone_and_neck():
