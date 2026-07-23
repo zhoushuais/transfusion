@@ -135,7 +135,6 @@ param_scheduler = [
         pct_start=0.4,
         div_factor=10.0,
         final_div_factor=10000.0,
-        cycle_momentum=False,
         convert_to_iter_based=True,
     )
 ]

@@ -39,6 +39,7 @@ def test_lc_config_uses_single_camera_without_geometry_augmentation():
     assert 'RandomFlip3D' not in pipeline_types
     assert 'GlobalRotScaleTrans' not in pipeline_types
     assert cfg.train_cfg.max_epochs == 6
+    assert 'cycle_momentum' not in cfg.param_scheduler[0]
 
 
 def test_2d_pretraining_config_contract():
