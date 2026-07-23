@@ -1401,7 +1401,7 @@ python projects/TransFusionKITTI/tools/smoke_test.py \
 
 Expected: finite losses, no gradients in frozen components, gradients in image-fusion modules, and `BACKWARD_OK`.
 
-- [ ] **Step 4: Run short training and validation**
+- [x] **Step 4: Run short training and validation**
 
 ```bash
 python tools/train.py \
@@ -1413,6 +1413,10 @@ python tools/train.py \
 ```
 
 After stage checkpoints exist, repeat for LC with `train_cfg.max_epochs=1`. Expected: an epoch completes, checkpoints are written, and no NaN/Inf loss appears.
+
+Verified on H800: LC loaded the merged LiDAR/image checkpoint without sparse
+encoder shape mismatches, completed 128 iterations over 64 unique samples with
+`RepeatDataset(times=2)`, and saved `epoch_1.pth` using FP32.
 
 - [ ] **Step 5: Run validation metric**
 

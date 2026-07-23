@@ -11,9 +11,10 @@ MMDetection3D 的模型结构，也没有使用 BEVFusion 的 LSS/BEV 图像融�
 体素化、TransFusion-L 模型构建，以及真实 KITTI 单样本的前向、有限损失
 和反向传播。TransFusion-L 的 FP32 64 样本短训练、恢复训练、普通与最佳
 checkpoint 保存及完整 KITTI AP40 评估均已运行；Stage 0 图像分支的
-64 样本短训练及 checkpoint 保存也已运行。正式全量训练精度和
-TransFusion-LC 融合阶段仍待服务器验证；完成这些验证前，不能把完整
-多模态基线写成“已跑通”或“已验证有效”。
+64 样本短训练及 checkpoint 保存也已运行。TransFusion-LC 已完成正确加载
+LiDAR/image 预训练权重后的单样本前反向、FP32 64 个唯一样本短训练及
+checkpoint 保存；完整 validation 和正式全量训练精度仍待服务器验证。
+完成这些验证前，不能把完整多模态基线写成“已跑通”或“已验证有效”。
 
 ## Environment check
 
@@ -221,8 +222,10 @@ python projects/TransFusionKITTI/tools/smoke_test.py \
   --checkpoint checkpoints/transfusion_kitti_stage2_init.pth
 ```
 
-再分别用固定的前 64 个训练样本跑 1 epoch。MMEngine 会在最后一个 epoch
-强制执行 validation，因此这里需要同时将三个验证配置设为 `None`：
+再分别用固定的前 64 个唯一训练样本跑 1 epoch。基础 KITTI 配置使用
+`RepeatDataset(times=2)`，因此日志会显示 128 iterations。MMEngine 会在
+最后一个 epoch 强制执行 validation，因此这里需要同时将三个验证配置设为
+`None`：
 
 ```bash
 python tools/train.py \
