@@ -190,7 +190,9 @@ homography_matrix
 - 合并脚本打印匹配、缺失、形状不符和未使用 key；骨干出现非预期缺失时直接失败。
 - 按原论文冻结 LiDAR backbone、LiDAR query 主路径、图像 backbone 和 FPN，并保持其 BN/归一化层为 eval 状态。
 - 训练 image-guided heatmap、image-to-BEV query initialization、query-image cross-attention 和融合预测头。
-- 首轮复现采用原论文 6 epoch 融合训练策略；单卡学习率按有效 batch size 线性缩放，必要时使用梯度累积保持固定有效 batch size。
+- 首轮复现采用原论文 6 epoch 融合训练策略；单 H800 的正式 batch/LR
+  口径以 `2026-07-23-transfusion-kitti-single-h800-training-design.md` 为准，
+  使用梯度累积保持名义等效全局 batch，不再采用线性学习率缩放。
 
 ## 8. 推理与评估
 
