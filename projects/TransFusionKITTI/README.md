@@ -3,11 +3,17 @@
 本项目在 MMDetection3D 1.4 中重建原版 TransFusion 的 LiDAR query 与
 query-level 相机-LiDAR 融合，并适配 KITTI `Pedestrian`、`Cyclist`、`Car`
 三类别。代码独立放在 `projects/TransFusionKITTI`，没有修改
-MMDetection3D 核心，也没有使用 BEVFusion 的 LSS/BEV 图像融合。
+MMDetection3D 的模型结构，也没有使用 BEVFusion 的 LSS/BEV 图像融合；
+核心目录仅包含一处 NumPy 兼容修复，将已删除的 `np.long` 替换为
+语义等价的 `np.int64`。
 
-当前状态：迁移源码、配置和工具已实现；H800 上的 CUDA 构建、单样本
-前反向、短训练和 AP40 评估仍需按本文命令验证。完成这些验证前，不能把
-该基线写成“已跑通”或“已验证有效”。
+当前状态：迁移源码、配置和工具已实现；已在 H800 上验证 MMCV CUDA
+体素化、TransFusion-L 模型构建，以及真实 KITTI 单样本的前向、有限损失
+和反向传播。TransFusion-L 的 FP32 64 样本短训练、恢复训练、普通与最佳
+checkpoint 保存及完整 KITTI AP40 评估均已运行；Stage 0 图像分支的
+64 样本短训练及 checkpoint 保存也已运行。正式全量训练精度和
+TransFusion-LC 融合阶段仍待服务器验证；完成这些验证前，不能把完整
+多模态基线写成“已跑通”或“已验证有效”。
 
 ## Environment check
 
@@ -110,11 +116,22 @@ python projects/TransFusionKITTI/tools/convert_kitti_2d_to_coco.py \
 训练 KITTI 三类别 Faster R-CNN R50-FPN。阶段 2 只取其
 `backbone.*` 和 `neck.*` 权重：
 
+内网服务器先把官方 COCO 预训练权重放到：
+
+```text
+checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth
+```
+
 ```bash
 python tools/train.py \
   projects/TransFusionKITTI/configs/r50_fpn_kitti_2d.py \
-  --work-dir work_dirs/r50_fpn_kitti_2d
+  --work-dir work_dirs/r50_fpn_kitti_2d \
+  --cfg-options \
+    load_from=checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth
 ```
+
+COCO 的 80 类 bbox head 与 KITTI 三类别 head 尺寸不匹配是预期警告；
+这些层会重新初始化，backbone 和 FPN 权重仍会正常加载。
 
 ## Stage 1: TransFusion-L
 
@@ -127,8 +144,11 @@ python projects/TransFusionKITTI/tools/smoke_test.py \
 
 python tools/train.py \
   projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --amp --work-dir work_dirs/transfusion_l_kitti
+  --work-dir work_dirs/transfusion_l_kitti
 ```
+
+正式基线使用 FP32，与原版 TransFusion 配置一致。当前不要追加 `--amp`；
+迁移后的全局 autocast 会使 bbox 解码和 Hungarian 匹配出现半精度数值溢出。
 
 ## Checkpoint merge
 
@@ -149,7 +169,9 @@ python projects/TransFusionKITTI/tools/merge_pretrained_weights.py \
 ```
 
 合并脚本会输出映射、跳过和覆盖数量，并把两个来源文件的 SHA-256 写入
-checkpoint metadata。出现零 image key 或形状冲突时会中止。
+checkpoint metadata，同时保留 spconv2 加载卷积核所需的
+`state_dict._metadata`。出现零 image key 或形状冲突时会中止；如果日志仍有
+`middle_encoder` 尺寸不匹配，不得在 `freeze_lidar=True` 下继续训练。
 
 ## Stage 2: TransFusion-LC
 
@@ -164,7 +186,7 @@ python projects/TransFusionKITTI/tools/smoke_test.py \
 
 python tools/train.py \
   projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
-  --amp --work-dir work_dirs/transfusion_lc_kitti \
+  --work-dir work_dirs/transfusion_lc_kitti \
   --cfg-options load_from=checkpoints/transfusion_kitti_stage2_init.pth
 ```
 
@@ -177,7 +199,8 @@ python tools/test.py \
   --show-dir work_dirs/transfusion_lc_kitti/visualization
 ```
 
-主指标是 `pred_instances_3d/KITTI/Overall_3D_AP40_moderate`，同时完整记录
+主指标是 `Kitti metric/pred_instances_3d/KITTI/Overall_3D_AP40_moderate`，
+同时完整记录
 三类别 3D AP40 的 Easy、Moderate、Hard。论文正式结果仍需三次独立运行取
 平均，单次跑通只能记为“已运行”。
 
@@ -198,22 +221,24 @@ python projects/TransFusionKITTI/tools/smoke_test.py \
   --checkpoint checkpoints/transfusion_kitti_stage2_init.pth
 ```
 
-再分别用固定的前 64 个训练样本跑 1 epoch。`val_interval=2` 用于避免在
-这个阶段触发完整 validation：
+再分别用固定的前 64 个训练样本跑 1 epoch。MMEngine 会在最后一个 epoch
+强制执行 validation，因此这里需要同时将三个验证配置设为 `None`：
 
 ```bash
 python tools/train.py \
   projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --amp --work-dir work_dirs/transfusion_l_kitti_smoke \
-  --cfg-options train_cfg.max_epochs=1 train_cfg.val_interval=2 \
+  --work-dir work_dirs/transfusion_l_kitti_smoke \
+  --cfg-options train_cfg.max_epochs=1 \
+    val_cfg=None val_dataloader=None val_evaluator=None \
     train_dataloader.batch_size=1 \
     train_dataloader.dataset.dataset.indices=64
 
 python tools/train.py \
   projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
-  --amp --work-dir work_dirs/transfusion_lc_kitti_smoke \
+  --work-dir work_dirs/transfusion_lc_kitti_smoke \
   --cfg-options load_from=checkpoints/transfusion_kitti_stage2_init.pth \
-    train_cfg.max_epochs=1 train_cfg.val_interval=2 \
+    train_cfg.max_epochs=1 \
+    val_cfg=None val_dataloader=None val_evaluator=None \
     train_dataloader.batch_size=1 \
     train_dataloader.dataset.dataset.indices=64
 ```

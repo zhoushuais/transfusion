@@ -1,4 +1,5 @@
 # flake8: noqa: E402
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -51,3 +52,54 @@ def test_merge_rejects_shape_collision(tmp_path: Path):
     torch.save({'state_dict': {'backbone.conv.weight': torch.ones(3)}}, image)
     with pytest.raises(RuntimeError, match='shape collision'):
         merge(lidar, image, output)
+
+
+def test_merge_preserves_and_remaps_state_dict_metadata(tmp_path: Path):
+    lidar = tmp_path / 'lidar.pth'
+    image = tmp_path / 'image.pth'
+    output = tmp_path / 'merged.pth'
+
+    lidar_state = OrderedDict({
+        'module.middle_encoder.conv_input.0.weight': torch.ones(1)
+    })
+    lidar_state._metadata = OrderedDict({
+        '': {
+            'version': 1
+        },
+        'module': {
+            'version': 1
+        },
+        'module.middle_encoder': {
+            'version': 2
+        },
+        'module.middle_encoder.conv_input': {
+            'version': 2
+        },
+    })
+    image_state = OrderedDict({
+        'module.backbone.conv.weight': torch.full((1, ), 2.0),
+        'module.neck.fpn.weight': torch.full((1, ), 3.0),
+    })
+    image_state._metadata = OrderedDict({
+        'module.backbone': {
+            'version': 3
+        },
+        'module.backbone.conv': {
+            'version': 4
+        },
+        'module.neck': {
+            'version': 5
+        },
+    })
+    torch.save({'state_dict': lidar_state}, lidar)
+    torch.save({'state_dict': image_state}, image)
+
+    merge(lidar, image, output)
+    saved_state = torch.load(output, map_location='cpu')['state_dict']
+
+    assert isinstance(saved_state, OrderedDict)
+    assert saved_state._metadata['middle_encoder']['version'] == 2
+    assert saved_state._metadata['middle_encoder.conv_input']['version'] == 2
+    assert saved_state._metadata['img_backbone']['version'] == 3
+    assert saved_state._metadata['img_backbone.conv']['version'] == 4
+    assert saved_state._metadata['img_neck']['version'] == 5

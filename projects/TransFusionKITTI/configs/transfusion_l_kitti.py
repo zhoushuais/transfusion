@@ -144,6 +144,8 @@ default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook',
         interval=1,
-        save_best='pred_instances_3d/KITTI/Overall_3D_AP40_moderate',
+        save_best=(
+            'Kitti metric/pred_instances_3d/KITTI/'
+            'Overall_3D_AP40_moderate'),
         rule='greater',
     ))

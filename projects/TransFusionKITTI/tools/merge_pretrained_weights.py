@@ -2,8 +2,9 @@
 
 import argparse
 import hashlib
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -16,11 +17,48 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _strip_module_prefix(state_dict: dict) -> dict:
-    return {
-        (key[7:] if key.startswith('module.') else key): value
+def _strip_module_prefix(state_dict: dict) -> OrderedDict:
+    stripped = OrderedDict(
+        ((key[7:] if key.startswith('module.') else key), value)
         for key, value in state_dict.items()
-    }
+    )
+    metadata = getattr(state_dict, '_metadata', None)
+    if metadata is not None:
+        stripped._metadata = OrderedDict()
+        for key, value in metadata.items():
+            if key == 'module':
+                target_key = ''
+            elif key.startswith('module.'):
+                target_key = key[7:]
+            else:
+                target_key = key
+            stripped._metadata[target_key] = value
+    return stripped
+
+
+def _map_image_key(source_key: str) -> Optional[str]:
+    if source_key == 'backbone':
+        return 'img_backbone'
+    if source_key.startswith('backbone.'):
+        return f'img_backbone.{source_key[len("backbone."):]}'
+    if source_key == 'neck':
+        return 'img_neck'
+    if source_key.startswith('neck.'):
+        return f'img_neck.{source_key[len("neck."):]}'
+    return None
+
+
+def _merge_image_metadata(merged_state: OrderedDict,
+                          image_state: OrderedDict) -> None:
+    image_metadata = getattr(image_state, '_metadata', None)
+    if image_metadata is None:
+        return
+    if getattr(merged_state, '_metadata', None) is None:
+        merged_state._metadata = OrderedDict()
+    for source_key, value in image_metadata.items():
+        target_key = _map_image_key(source_key)
+        if target_key is not None:
+            merged_state._metadata[target_key] = value
 
 
 def _checkpoint(path: Path) -> dict:
@@ -49,11 +87,8 @@ def merge(lidar_path: Path, image_path: Path,
     skipped = []
     overwritten = []
     for source_key in sorted(image_state):
-        if source_key.startswith('backbone.'):
-            target_key = f'img_backbone.{source_key[len("backbone."):]}'
-        elif source_key.startswith('neck.'):
-            target_key = f'img_neck.{source_key[len("neck."):]}'
-        else:
+        target_key = _map_image_key(source_key)
+        if target_key is None:
             skipped.append(source_key)
             continue
         source_value = image_state[source_key]
@@ -66,6 +101,8 @@ def merge(lidar_path: Path, image_path: Path,
             overwritten.append(target_key)
         merged_state[target_key] = source_value
         mapped.append((source_key, target_key))
+
+    _merge_image_metadata(merged_state, image_state)
 
     if not mapped:
         raise RuntimeError('no image backbone or neck keys were mapped')

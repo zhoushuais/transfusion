@@ -583,7 +583,8 @@ def test_lidar_config_contract():
     assert cfg.train_dataloader.dataset.dataset.metainfo['classes'] == (
         'Pedestrian', 'Cyclist', 'Car')
     assert cfg.default_hooks.checkpoint.save_best == (
-        'pred_instances_3d/KITTI/Overall_3D_AP40_moderate')
+        'Kitti metric/pred_instances_3d/KITTI/'
+        'Overall_3D_AP40_moderate')
 ```
 
 - [ ] **Step 2: Verify failure**
@@ -639,7 +640,9 @@ Use the project matcher and modern losses. Override checkpoint configuration:
 default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook', interval=1,
-        save_best='pred_instances_3d/KITTI/Overall_3D_AP40_moderate',
+        save_best=(
+            'Kitti metric/pred_instances_3d/KITTI/'
+            'Overall_3D_AP40_moderate'),
         rule='greater'))
 ```
 
@@ -947,7 +950,9 @@ Pack3DDetInputs(keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
                            'homography_matrix'))
 ```
 
-Set `train_cfg.max_epochs=6`. Use AMP as an optional CLI override, not a hidden config default.
+Set `train_cfg.max_epochs=6`. Keep the paper-faithful baseline in FP32. Do not
+enable the modern global AMP override until the original `force_fp32` loss
+boundary has been ported and verified separately.
 
 - [ ] **Step 5: Run tests and commit**
 
@@ -1269,8 +1274,7 @@ python tools/train.py \
   projects/TransFusionKITTI/configs/r50_fpn_kitti_2d.py
 
 python tools/train.py \
-  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --amp
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py
 
 python projects/TransFusionKITTI/tools/merge_pretrained_weights.py \
   --lidar work_dirs/transfusion_l_kitti/best_3d_moderate_mean.pth \
@@ -1279,7 +1283,6 @@ python projects/TransFusionKITTI/tools/merge_pretrained_weights.py \
 
 python tools/train.py \
   projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
-  --amp \
   --cfg-options load_from=checkpoints/transfusion_kitti_stage2_init.pth
 ```
 
@@ -1403,7 +1406,6 @@ Expected: finite losses, no gradients in frozen components, gradients in image-f
 ```bash
 python tools/train.py \
   projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --amp \
   --work-dir work_dirs/transfusion_l_kitti_smoke \
   --cfg-options train_cfg.max_epochs=1 val_cfg=None \
                 val_dataloader=None val_evaluator=None \
@@ -1420,7 +1422,7 @@ python tools/test.py \
   work_dirs/transfusion_lc_kitti_smoke/epoch_1.pth
 ```
 
-Expected: `KittiMetric` prints bbox, BEV and 3D AP11/AP40, including `pred_instances_3d/KITTI/Overall_3D_AP40_moderate`.
+Expected: `KittiMetric` prints bbox, BEV and 3D AP11/AP40, including `Kitti metric/pred_instances_3d/KITTI/Overall_3D_AP40_moderate`.
 
 - [ ] **Step 6: Mark baseline status accurately**
 

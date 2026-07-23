@@ -75,6 +75,16 @@ def load_model_checkpoint(model, checkpoint: Path, loader) -> None:
     loader(model, str(checkpoint), map_location='cpu', strict=False)
 
 
+def select_device(device_name: str):
+    """Select the CUDA context required by spconv before model execution."""
+    import torch
+
+    device = torch.device(device_name)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    return device
+
+
 def run(args) -> None:
     import torch
     from mmengine.config import Config
@@ -84,6 +94,7 @@ def run(args) -> None:
 
     from mmdet3d.registry import MODELS
 
+    device = select_device(args.device)
     cfg = Config.fromfile(str(args.config))
     if cfg.get('custom_imports'):
         import_modules_from_strings(**cfg.custom_imports)
@@ -93,7 +104,7 @@ def run(args) -> None:
     checkpoint = args.checkpoint or cfg.get('load_from')
     if checkpoint:
         load_model_checkpoint(model, checkpoint, load_checkpoint)
-    model.to(args.device)
+    model.to(device)
     if args.mode == 'build':
         print('MODEL_BUILD_OK')
         return

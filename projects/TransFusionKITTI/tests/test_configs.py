@@ -21,7 +21,8 @@ def test_lidar_config_contract():
         'Car',
     )
     assert cfg.default_hooks.checkpoint.save_best == (
-        'pred_instances_3d/KITTI/Overall_3D_AP40_moderate')
+        'Kitti metric/pred_instances_3d/KITTI/'
+        'Overall_3D_AP40_moderate')
 
 
 def test_lc_config_uses_single_camera_without_geometry_augmentation():
