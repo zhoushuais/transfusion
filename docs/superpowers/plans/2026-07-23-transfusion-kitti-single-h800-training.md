@@ -636,4 +636,3 @@ This implementation is complete only after:
 5. Stage 1/2 best checkpoints both complete 3769-sample KITTI AP40 evaluation.
 6. Logs, commit, checkpoint paths and SHA-256 records distinguish formal products from
    smoke products.
-
