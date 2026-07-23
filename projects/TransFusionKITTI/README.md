@@ -14,8 +14,7 @@ checkpoint 保存及完整 KITTI AP40 评估均已运行；Stage 0 图像分支�
 64 样本短训练及 checkpoint 保存也已运行。TransFusion-LC 已完成正确加载
 LiDAR/image 预训练权重后的单样本前反向、FP32 64 个唯一样本短训练及
 checkpoint 保存，并在 3769 个 KITTI validation 样本上完成完整 AP11/AP40
-评估。因此，现代框架迁移和 KITTI 多模态数据流已经跑通；正式全量训练精度
-仍待验证，不能把当前冒烟结果写成“多模态方法已验证有效”。
+评估。因此，现代框架迁移和 KITTI 多模态数据流已经跑通；单 H800 正式训练协议已经固化，但正式全量训练精度仍待验证，不能把 smoke 结果写成“多模态方法已验证有效”。
 
 ## Environment check
 
@@ -113,7 +112,14 @@ python projects/TransFusionKITTI/tools/convert_kitti_2d_to_coco.py \
   --output data/kitti/annotations/kitti_2d_val.json
 ```
 
-## Stage 0: image pretraining
+## Quick start (non-formal)
+
+> **注意：** 本节的 Stage 0/1、checkpoint merge、Stage 2 和 evaluation
+> 仅用于迁移验证与排障。这里的目录和 seed 不满足论文正式实验口径，不能把
+> 输出写入论文结果；正式训练和评估必须使用后面的
+> `Single-H800 formal training protocol`。
+
+### Stage 0: image pretraining (quick start, non-formal)
 
 训练 KITTI 三类别 Faster R-CNN R50-FPN。阶段 2 只取其
 `backbone.*` 和 `neck.*` 权重：
@@ -135,9 +141,9 @@ python tools/train.py \
 COCO 的 80 类 bbox head 与 KITTI 三类别 head 尺寸不匹配是预期警告；
 这些层会重新初始化，backbone 和 FPN 权重仍会正常加载。
 
-## Stage 1: TransFusion-L
+### Stage 1: TransFusion-L (quick start, non-formal)
 
-先做配置构建和单样本检查，再开始正式 LiDAR-only 训练：
+先做配置构建和单样本检查，再运行非正式 LiDAR-only 示例训练：
 
 ```bash
 python projects/TransFusionKITTI/tools/smoke_test.py \
@@ -149,10 +155,11 @@ python tools/train.py \
   --work-dir work_dirs/transfusion_l_kitti
 ```
 
-正式基线使用 FP32，与原版 TransFusion 配置一致。当前不要追加 `--amp`；
-迁移后的全局 autocast 会使 bbox 解码和 Hungarian 匹配出现半精度数值溢出。
+该示例和后面的正式基线均使用 FP32，与原版 TransFusion 配置一致。不要追加
+`--amp`；迁移后的全局 autocast 会使 bbox 解码和 Hungarian 匹配出现半精度
+数值溢出。
 
-## Checkpoint merge
+### Checkpoint merge (quick start, non-formal)
 
 先查看 MMEngine 实际保存的 best 文件名，不要假设固定别名：
 
@@ -175,7 +182,7 @@ checkpoint metadata，同时保留 spconv2 加载卷积核所需的
 `state_dict._metadata`。出现零 image key 或形状冲突时会中止；如果日志仍有
 `middle_encoder` 尺寸不匹配，不得在 `freeze_lidar=True` 下继续训练。
 
-## Stage 2: TransFusion-LC
+### Stage 2: TransFusion-LC (quick start, non-formal)
 
 阶段 2 冻结 LiDAR 主干、LiDAR query 路径、图像 ResNet 和 FPN，只训练
 原版 image-guided heatmap、query-image cross-attention 与融合预测头：
@@ -192,7 +199,7 @@ python tools/train.py \
   --cfg-options load_from=checkpoints/transfusion_kitti_stage2_init.pth
 ```
 
-## Evaluation
+### Evaluation (quick start, non-formal)
 
 ```bash
 python tools/test.py \
@@ -201,10 +208,348 @@ python tools/test.py \
   --show-dir work_dirs/transfusion_lc_kitti/visualization
 ```
 
-主指标是 `Kitti metric/pred_instances_3d/KITTI/Overall_3D_AP40_moderate`，
-同时完整记录
-三类别 3D AP40 的 Easy、Moderate、Hard。论文正式结果仍需三次独立运行取
-平均，单次跑通只能记为“已运行”。
+`Kitti metric/pred_instances_3d/KITTI/Overall_3D_AP40_moderate` 只用于
+Stage 1/2 的 best checkpoint 选择，不是论文主指标。论文核心指标是
+`Pedestrian` 和 `Cyclist` 的 KITTI AP_R40 3D Easy、Moderate、Hard；`Car`
+和 Overall 作为辅助约束与报告项。这个 quick-start evaluation 只验证迁移
+链路，不进入论文结果；论文正式结果仍需三次独立运行取平均。
+
+## Single-H800 formal training protocol
+
+单 H800 正式训练统一使用 FP32 和 MMEngine `OptimWrapper` 的梯度累积，
+首次启动不要追加 `--amp` 或 `--auto-scale-lr`。三阶段批量口径如下：
+
+| 阶段 | micro-batch | `accumulative_counts` | nominal batch |
+|---|---:|---:|---:|
+| Stage 0 image | 4 | 4 | 16 |
+| Stage 1 LiDAR | 6 | 8 | 48 |
+| Stage 2 LC | 2 | 8 | 16 |
+
+nominal batch 只表示一次 optimizer update 汇总的样本数；BatchNorm 统计仍按
+micro-batch 计算。Stage 1 因 epoch 尾部不能整除累计窗口，约 0.2% 的样本
+存在 optimizer update 边界差异，因此单 H800 梯度累积不能写成与八卡 DDP
+完全等价。
+
+### Formal run1 preflight and config dump
+
+run1 固定使用物理 GPU 2 和 seed 0。任何正式产物写入前，先确认 tracked
+worktree 干净；`data` 等 untracked 文件不参与该检查。三个训练 work dir、
+Stage 2 初始化文件、SHA-256 清单、两个评估目录和 run1 配置 dump 目录都必须
+不存在，防止静默复用旧实验。通过检查后再创建目录，展开带完整 run1 覆盖项
+的最终配置，并人工确认批量、累计步数、学习率缩放、最大学习率和 epoch。
+本节三个严格 block 都在子 shell 中执行，失败只结束当前 block，不会关闭
+交互式 SSH shell：
+
+```bash
+(
+set -euo pipefail
+
+TRACKED_CHANGES=$(git status --short --untracked-files=no)
+if [[ -n "$TRACKED_CHANGES" ]]; then
+  printf 'ERROR: tracked worktree is not clean:\n%s\n' \
+    "$TRACKED_CHANGES" >&2
+  exit 1
+fi
+
+FORMAL_PATHS=(
+  work_dirs/r50_fpn_kitti_2d_formal_run1
+  work_dirs/transfusion_l_kitti_formal_run1
+  checkpoints/transfusion_kitti_stage2_formal_run1_init.pth
+  work_dirs/transfusion_lc_kitti_formal_run1
+  work_dirs/transfusion_kitti_formal_config_dumps/run1
+  work_dirs/transfusion_kitti_formal_run1_sha256.txt
+  work_dirs/transfusion_l_kitti_formal_run1_eval
+  work_dirs/transfusion_lc_kitti_formal_run1_eval
+)
+for path in "${FORMAL_PATHS[@]}"; do
+  if [[ -e "$path" ]]; then
+    printf 'ERROR: formal run1 path already exists: %s\n' "$path" >&2
+    exit 1
+  fi
+done
+
+mkdir -p \
+  work_dirs/r50_fpn_kitti_2d_formal_run1 \
+  work_dirs/transfusion_l_kitti_formal_run1 \
+  work_dirs/transfusion_lc_kitti_formal_run1 \
+  work_dirs/transfusion_kitti_formal_config_dumps/run1 \
+  checkpoints
+
+CONFIG_DUMP_DIR=work_dirs/transfusion_kitti_formal_config_dumps/run1
+python tools/misc/print_config.py \
+  projects/TransFusionKITTI/configs/r50_fpn_kitti_2d.py \
+  --options \
+    work_dir=work_dirs/r50_fpn_kitti_2d_formal_run1 \
+    load_from=checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
+    randomness.seed=0 randomness.deterministic=False \
+  > "$CONFIG_DUMP_DIR/stage0.py"
+python tools/misc/print_config.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --options \
+    work_dir=work_dirs/transfusion_l_kitti_formal_run1 \
+    randomness.seed=0 randomness.deterministic=False \
+  > "$CONFIG_DUMP_DIR/stage1.py"
+python tools/misc/print_config.py \
+  projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
+  --options \
+    work_dir=work_dirs/transfusion_lc_kitti_formal_run1 \
+    load_from=checkpoints/transfusion_kitti_stage2_formal_run1_init.pth \
+    randomness.seed=0 randomness.deterministic=False \
+  > "$CONFIG_DUMP_DIR/stage2.py"
+grep -En 'batch_size|accumulative_counts|auto_scale_lr|eta_max|max_epochs' \
+  "$CONFIG_DUMP_DIR"/stage{0,1,2}.py
+)
+```
+
+### Formal run1 first launch
+
+preflight 后每个阶段在对应 work dir 记录实际训练源码 commit。下面三个首次
+训练命令均为 FP32，且不使用自动学习率缩放或断点恢复。
+
+Stage 0：
+
+```bash
+git rev-parse HEAD \
+  > work_dirs/r50_fpn_kitti_2d_formal_run1/source_commit.txt
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/r50_fpn_kitti_2d.py \
+  --work-dir work_dirs/r50_fpn_kitti_2d_formal_run1 \
+  --cfg-options \
+    load_from=checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
+    randomness.seed=0 randomness.deterministic=False
+```
+
+Stage 1：
+
+```bash
+git rev-parse HEAD \
+  > work_dirs/transfusion_l_kitti_formal_run1/source_commit.txt
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --work-dir work_dirs/transfusion_l_kitti_formal_run1 \
+  --cfg-options randomness.seed=0 randomness.deterministic=False
+```
+
+Stage 0 和 Stage 1 完成后，不假设 best checkpoint 的固定文件名。每一类
+`best*.pth` 必须恰好有一个候选；零个或多个都中止并打印候选，不能任取一个
+继续。严格检查通过后，在同一个 shell 中合并、记录三个文件的 SHA-256，
+并校验 spconv2 metadata 及两个来源文件的路径和实际摘要：
+
+```bash
+(
+set -euo pipefail
+
+mapfile -t IMAGE_CANDIDATES < <(
+  find work_dirs/r50_fpn_kitti_2d_formal_run1 \
+    -maxdepth 1 -type f -name 'best*.pth' -print | LC_ALL=C sort
+)
+if (( ${#IMAGE_CANDIDATES[@]} != 1 )); then
+  printf 'ERROR: expected exactly one image best checkpoint, found %d\n' \
+    "${#IMAGE_CANDIDATES[@]}" >&2
+  if (( ${#IMAGE_CANDIDATES[@]} == 0 )); then
+    printf '  <none>\n' >&2
+  else
+    printf '  %s\n' "${IMAGE_CANDIDATES[@]}" >&2
+  fi
+  exit 1
+fi
+
+mapfile -t LIDAR_CANDIDATES < <(
+  find work_dirs/transfusion_l_kitti_formal_run1 \
+    -maxdepth 1 -type f -name 'best*.pth' -print | LC_ALL=C sort
+)
+if (( ${#LIDAR_CANDIDATES[@]} != 1 )); then
+  printf 'ERROR: expected exactly one LiDAR best checkpoint, found %d\n' \
+    "${#LIDAR_CANDIDATES[@]}" >&2
+  if (( ${#LIDAR_CANDIDATES[@]} == 0 )); then
+    printf '  <none>\n' >&2
+  else
+    printf '  %s\n' "${LIDAR_CANDIDATES[@]}" >&2
+  fi
+  exit 1
+fi
+
+export IMAGE_BEST="${IMAGE_CANDIDATES[0]}"
+export LIDAR_BEST="${LIDAR_CANDIDATES[0]}"
+STAGE2_INIT=checkpoints/transfusion_kitti_stage2_formal_run1_init.pth
+
+python projects/TransFusionKITTI/tools/merge_pretrained_weights.py \
+  --lidar "$LIDAR_BEST" \
+  --image "$IMAGE_BEST" \
+  --output "$STAGE2_INIT"
+
+sha256sum "$IMAGE_BEST" "$LIDAR_BEST" "$STAGE2_INIT" \
+  > work_dirs/transfusion_kitti_formal_run1_sha256.txt
+
+python - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+
+import torch
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+checkpoint = torch.load(
+    'checkpoints/transfusion_kitti_stage2_formal_run1_init.pth',
+    map_location='cpu')
+metadata = getattr(checkpoint['state_dict'], '_metadata', {})
+assert metadata.get('middle_encoder.conv_input.0') == {'version': 2}
+
+sources = checkpoint.get('meta', {}).get('transfusion_kitti_sources', {})
+print('transfusion_kitti_sources:', sources)
+for role, env_name in (('lidar', 'LIDAR_BEST'), ('image', 'IMAGE_BEST')):
+    expected_path = Path(os.environ[env_name]).resolve()
+    actual_path = Path(sources[role]['path']).resolve()
+    print(f'{role} path: expected={expected_path} actual={actual_path}')
+    assert actual_path == expected_path
+
+    expected_digest = sources[role]['sha256']
+    actual_digest = sha256(expected_path)
+    print(
+        f'{role} sha256: expected={expected_digest} '
+        f'actual={actual_digest}')
+    assert actual_digest == expected_digest
+PY
+)
+```
+
+Stage 2：
+
+```bash
+git rev-parse HEAD \
+  > work_dirs/transfusion_lc_kitti_formal_run1/source_commit.txt
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
+  --work-dir work_dirs/transfusion_lc_kitti_formal_run1 \
+  --cfg-options \
+    load_from=checkpoints/transfusion_kitti_stage2_formal_run1_init.pth \
+    randomness.seed=0 randomness.deterministic=False
+```
+
+### Formal run1 resume
+
+恢复训练只能使用首次启动时的原配置、原 work dir 和相同 cfg options。
+MMEngine 会在指定 work dir 中优先恢复 `latest` checkpoint。禁止把
+`*_smoke/epoch_1.pth` 当作正式训练恢复点。
+
+Stage 0 恢复：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/r50_fpn_kitti_2d.py \
+  --work-dir work_dirs/r50_fpn_kitti_2d_formal_run1 \
+  --resume \
+  --cfg-options \
+    load_from=checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
+    randomness.seed=0 randomness.deterministic=False
+```
+
+Stage 1 恢复：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --work-dir work_dirs/transfusion_l_kitti_formal_run1 \
+  --resume \
+  --cfg-options randomness.seed=0 randomness.deterministic=False
+```
+
+Stage 2 恢复：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
+  --work-dir work_dirs/transfusion_lc_kitti_formal_run1 \
+  --resume \
+  --cfg-options \
+    load_from=checkpoints/transfusion_kitti_stage2_formal_run1_init.pth \
+    randomness.seed=0 randomness.deterministic=False
+```
+
+### Formal run2 and run3 gate
+
+只有 run1 的 loss 曲线、AP40、checkpoint 完整性和日志均审查通过后，才能
+启动 run2 与 run3。run2 使用 seed 1，目录和初始化文件分别为
+`work_dirs/r50_fpn_kitti_2d_formal_run2`、
+`work_dirs/transfusion_l_kitti_formal_run2`、
+`checkpoints/transfusion_kitti_stage2_formal_run2_init.pth` 和
+`work_dirs/transfusion_lc_kitti_formal_run2`；run3 使用 seed 2，对应路径中的
+`formal_run2` 全部替换为 `formal_run3`。除 seed 和 run 编号外，FP32、GPU、
+配置展开、source commit、动态 best 查找、合并校验、SHA-256 记录和评估口径
+均与 run1 相同。配置展开必须分别写入
+`work_dirs/transfusion_kitti_formal_config_dumps/run2/` 和
+`work_dirs/transfusion_kitti_formal_config_dumps/run3/`，并使用 seed 1 和 2；
+每次都要先执行对应 run 的严格 preflight，不能覆盖 run1 或其他 run 的目录。
+
+## Formal run1 evaluation
+
+Stage 1 和 Stage 2 正式训练完成后，动态查找各自的 best checkpoint 并在
+物理 GPU 2 上完整评估：
+
+```bash
+(
+set -euo pipefail
+
+mapfile -t LIDAR_CANDIDATES < <(
+  find work_dirs/transfusion_l_kitti_formal_run1 \
+    -maxdepth 1 -type f -name 'best*.pth' -print | LC_ALL=C sort
+)
+if (( ${#LIDAR_CANDIDATES[@]} != 1 )); then
+  printf 'ERROR: expected exactly one LiDAR best checkpoint, found %d\n' \
+    "${#LIDAR_CANDIDATES[@]}" >&2
+  if (( ${#LIDAR_CANDIDATES[@]} == 0 )); then
+    printf '  <none>\n' >&2
+  else
+    printf '  %s\n' "${LIDAR_CANDIDATES[@]}" >&2
+  fi
+  exit 1
+fi
+
+mapfile -t LC_CANDIDATES < <(
+  find work_dirs/transfusion_lc_kitti_formal_run1 \
+    -maxdepth 1 -type f -name 'best*.pth' -print | LC_ALL=C sort
+)
+if (( ${#LC_CANDIDATES[@]} != 1 )); then
+  printf 'ERROR: expected exactly one LC best checkpoint, found %d\n' \
+    "${#LC_CANDIDATES[@]}" >&2
+  if (( ${#LC_CANDIDATES[@]} == 0 )); then
+    printf '  <none>\n' >&2
+  else
+    printf '  %s\n' "${LC_CANDIDATES[@]}" >&2
+  fi
+  exit 1
+fi
+
+LIDAR_BEST="${LIDAR_CANDIDATES[0]}"
+LC_BEST="${LC_CANDIDATES[0]}"
+
+mkdir -p work_dirs/transfusion_l_kitti_formal_run1_eval
+CUDA_VISIBLE_DEVICES=2 python tools/test.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  "$LIDAR_BEST" \
+  --work-dir work_dirs/transfusion_l_kitti_formal_run1_eval
+
+mkdir -p work_dirs/transfusion_lc_kitti_formal_run1_eval
+CUDA_VISIBLE_DEVICES=2 python tools/test.py \
+  projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
+  "$LC_BEST" \
+  --work-dir work_dirs/transfusion_lc_kitti_formal_run1_eval
+)
+```
+
+两次评估都要完整记录三类别 KITTI AP_R40 3D 的 Easy、Moderate、Hard。
+论文核心指标是 `Pedestrian` 和 `Cyclist` 的这些指标；`Car` 作为辅助约束，
+`Kitti metric/pred_instances_3d/KITTI/Overall_3D_AP40_moderate` 作为 Stage 1/2
+best checkpoint 选择指标和辅助报告项，不是论文主指标。Stage 2 只与同一
+run1 的 Stage 1 比较；smoke AP 只验证链路，不进入论文结果。
 
 ## H800 smoke test
 
