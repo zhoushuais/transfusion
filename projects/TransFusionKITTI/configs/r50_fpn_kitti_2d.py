@@ -10,6 +10,8 @@ image_scale = (1280, 384)
 
 model = dict(roi_head=dict(bbox_head=dict(num_classes=3)))
 
+optim_wrapper = dict(accumulative_counts=4)
+
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),

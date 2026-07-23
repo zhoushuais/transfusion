@@ -140,6 +140,8 @@ train_dataloader = dict(dataset=dict(dataset=dict(metainfo=metainfo)))
 val_dataloader = dict(dataset=dict(metainfo=metainfo))
 test_dataloader = dict(dataset=dict(metainfo=metainfo))
 
+optim_wrapper = dict(accumulative_counts=8)
+
 default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook',
