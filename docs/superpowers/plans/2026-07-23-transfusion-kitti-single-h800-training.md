@@ -540,8 +540,9 @@ CUDA_VISIBLE_DEVICES=2 python tools/train.py \
 ```
 
 Expected: four micro-batch iterations complete, one accumulated optimizer update is
-performed, loss and grad norm are finite, and `epoch_1.pth` is saved. The local COCO
-checkpoint is loaded, and configured `batch_size=4` is not overridden.
+performed, loss is finite, the log reaches `4/4`, the config snapshot shows
+`accumulative_counts=4`, and `epoch_1.pth` is saved. The local COCO checkpoint is loaded,
+and configured `batch_size=4` is not overridden.
 
 - [ ] **Step 4: Run Stage 1 for one effective optimizer update**
 
