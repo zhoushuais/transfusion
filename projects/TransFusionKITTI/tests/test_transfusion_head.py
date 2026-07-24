@@ -5,12 +5,14 @@ torch = pytest.importorskip('torch')
 pytest.importorskip('mmcv')
 pytest.importorskip('mmdet')
 from mmengine.config import ConfigDict
+from mmengine.registry import init_default_scope
 
 from projects.TransFusionKITTI.transfusion_kitti.models import \
     TransFusionKITTIHead
 
 
 def make_head(fuse_img=False):
+    init_default_scope('mmdet3d')
     return TransFusionKITTIHead(
         fuse_img=fuse_img,
         num_proposals=20,
