@@ -551,46 +551,357 @@ CUDA_VISIBLE_DEVICES=2 python tools/test.py \
 best checkpoint 选择指标和辅助报告项，不是论文主指标。Stage 2 只与同一
 run1 的 Stage 1 比较；smoke AP 只验证链路，不进入论文结果。
 
-## H800 smoke test
+## H800 gradient-accumulation smoke test
 
-依次执行：
+此前的 FP32 64 样本 smoke 已验证现代框架迁移、KITTI 数据流、checkpoint
+加载与评估链路。本节不是重复该结论，而是在梯度累积配置改动后、正式 run1
+启动前进行一次三阶段验收：确认三份正式配置在单张 H800 上能够按 4/8/8 个
+micro iteration 完成一次 optimizer update 并保存 checkpoint。smoke AP 只用于
+检查执行链路，不能写入论文结果或用于论证方法有效性。
+
+### Accumulation smoke preflight
+
+在 H800 服务器的仓库根目录执行以下严格 preflight。`29837e49267312d7d34dfbae75d88fb110cfd0f0`
+是已审查的 config/test/runbook 最低基线；后续纯文档修复可以位于其上，因此
+只要求该提交是当前 `HEAD` 的 ancestor。preflight 会把真正用于本次 H800
+实测的当前 SHA 同时打印并记录到
+`work_dirs/transfusion_kitti_accum_smoke_commit.txt`。已有 smoke 目录不得删除、
+清空或复用；任何一个已存在时，本次验收立即停止并改用经过记录的新后缀目录。
 
 ```bash
-python -m pytest -q projects/TransFusionKITTI/tests
-python -m compileall -q projects/TransFusionKITTI
+(
+set -euo pipefail
 
-python projects/TransFusionKITTI/tools/smoke_test.py \
-  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --device cuda:0 --mode backward
-python projects/TransFusionKITTI/tools/smoke_test.py \
-  projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
-  --device cuda:0 --mode predict \
-  --checkpoint checkpoints/transfusion_kitti_stage2_init.pth
+EXPECTED_BRANCH=codex/transfusion-kitti-h800-training
+REVIEWED_BASELINE=29837e49267312d7d34dfbae75d88fb110cfd0f0
+ACTUAL_BRANCH=$(git branch --show-current)
+if [[ "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]]; then
+  printf 'ERROR: expected branch %s, got %s\n' \
+    "$EXPECTED_BRANCH" "$ACTUAL_BRANCH" >&2
+  exit 1
+fi
+if ! git merge-base --is-ancestor "$REVIEWED_BASELINE" HEAD; then
+  printf 'ERROR: reviewed baseline %s is not an ancestor of HEAD\n' \
+    "$REVIEWED_BASELINE" >&2
+  exit 1
+fi
+
+WORKTREE_CHANGES=$(git status --porcelain)
+if [[ -n "$WORKTREE_CHANGES" ]]; then
+  printf 'ERROR: worktree is not clean:\n%s\n' \
+    "$WORKTREE_CHANGES" >&2
+  exit 1
+fi
+
+SMOKE_DIRS=(
+  work_dirs/r50_fpn_kitti_2d_accum_smoke
+  work_dirs/transfusion_l_kitti_accum_smoke
+  work_dirs/transfusion_lc_kitti_accum_smoke
+)
+for path in "${SMOKE_DIRS[@]}"; do
+  if [[ -e "$path" ]]; then
+    printf 'ERROR: smoke directory already exists; do not delete or reuse it: %s\n' \
+      "$path" >&2
+    exit 1
+  fi
+done
+
+for checkpoint in \
+  checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
+  checkpoints/transfusion_kitti_stage2_init.pth; do
+  if [[ ! -f "$checkpoint" ]]; then
+    printf 'ERROR: required local smoke checkpoint is missing: %s\n' \
+      "$checkpoint" >&2
+    exit 1
+  fi
+done
+
+mkdir -p work_dirs
+CURRENT_SHA=$(git rev-parse HEAD)
+printf '%s\n' "$CURRENT_SHA" | \
+  tee work_dirs/transfusion_kitti_accum_smoke_commit.txt
+)
 ```
 
-再分别用固定的前 64 个唯一训练样本跑 1 epoch。基础 KITTI 配置使用
-`RepeatDataset(times=2)`，因此日志会显示 128 iterations。MMEngine 会在
-最后一个 epoch 强制执行 validation，因此这里需要同时将三个验证配置设为
-`None`：
+### Tests before training
+
+先运行完整项目测试和 Python 编译检查。H800 环境已经配置 PyTorch、MMCV、
+MMEngine、MMDetection、MMDetection3D 和 spconv；相关模块不能以依赖缺失为由
+skip。以下 block 遇到测试 fail、任何 skip 或编译错误都会失败；此时停止，
+不得开始训练。
 
 ```bash
-python tools/train.py \
-  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --work-dir work_dirs/transfusion_l_kitti_smoke \
-  --cfg-options train_cfg.max_epochs=1 \
-    val_cfg=None val_dataloader=None val_evaluator=None \
-    train_dataloader.batch_size=1 \
-    train_dataloader.dataset.dataset.indices=64
+(
+set -euo pipefail
 
-python tools/train.py \
-  projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
-  --work-dir work_dirs/transfusion_lc_kitti_smoke \
-  --cfg-options load_from=checkpoints/transfusion_kitti_stage2_init.pth \
+PYTEST_OUTPUT=$(mktemp)
+trap 'rm -f "$PYTEST_OUTPUT"' EXIT
+if ! python -m pytest -q projects/TransFusionKITTI/tests 2>&1 | \
+    tee "$PYTEST_OUTPUT"; then
+  printf 'ERROR: project tests failed; do not start smoke training\n' >&2
+  exit 1
+fi
+if grep -Eq '[0-9]+ skipped' "$PYTEST_OUTPUT"; then
+  printf 'ERROR: H800 project tests reported skips; inspect dependencies first\n' >&2
+  exit 1
+fi
+python -m compileall -q projects/TransFusionKITTI
+)
+```
+
+### Stage 0: image accumulation smoke
+
+使用 GPU 2、seed 0 和本地 COCO checkpoint，取 16 个样本训练 1 epoch。不要
+覆盖配置中的 `batch_size=4`：预期共 4 个 micro iteration，以
+`accumulative_counts=4` 完成 1 次 optimizer update，并保存 `epoch_1.pth`。
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/r50_fpn_kitti_2d.py \
+  --work-dir work_dirs/r50_fpn_kitti_2d_accum_smoke \
+  --cfg-options \
+    load_from=checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
+    randomness.seed=0 randomness.deterministic=False \
     train_cfg.max_epochs=1 \
     val_cfg=None val_dataloader=None val_evaluator=None \
-    train_dataloader.batch_size=1 \
-    train_dataloader.dataset.dataset.indices=64
+    train_dataloader.dataset.indices=16
 ```
 
-全部通过后，再运行一次完整 validation。冒烟 checkpoint 的指标只用于验证
-评估链路，不进入论文结果；完整 validation 通过后才开始正式全量训练。
+### Stage 1: LiDAR accumulation smoke
+
+仍使用 GPU 2 和 seed 0，取 24 个唯一训练样本。不要覆盖配置中的
+`batch_size=6`；`RepeatDataset(times=2)` 后是 48 个样本，预期共 8 个 micro
+iteration，以 `accumulative_counts=8` 完成 1 次 optimizer update，并保存
+`epoch_1.pth`。
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --work-dir work_dirs/transfusion_l_kitti_accum_smoke \
+  --cfg-options \
+    randomness.seed=0 randomness.deterministic=False \
+    train_cfg.max_epochs=1 \
+    val_cfg=None val_dataloader=None val_evaluator=None \
+    train_dataloader.dataset.dataset.indices=24
+```
+
+### Stage 2: LC accumulation smoke
+
+使用 GPU 2 和 seed 0，加载此前已经验证可用的
+`checkpoints/transfusion_kitti_stage2_init.pth`。该文件只作为 smoke 初始化，
+不是 formal checkpoint，也不能代替 run1 的正式 Stage 0/1 合并产物。取 8 个
+唯一训练样本且不覆盖配置中的 `batch_size=2`；repeat 后是 16 个样本，预期
+共 8 个 micro iteration，以 `accumulative_counts=8` 完成 1 次 optimizer
+update，并保存 `epoch_1.pth`。
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/transfusion_lc_kitti.py \
+  --work-dir work_dirs/transfusion_lc_kitti_accum_smoke \
+  --cfg-options \
+    load_from=checkpoints/transfusion_kitti_stage2_init.pth \
+    randomness.seed=0 randomness.deterministic=False \
+    train_cfg.max_epochs=1 \
+    val_cfg=None val_dataloader=None val_evaluator=None \
+    train_dataloader.dataset.dataset.indices=8
+```
+
+以上三个命令全部使用 FP32，不得追加 `--amp`、`--auto-scale-lr` 或
+`--resume`。
+
+### Accumulation smoke acceptance
+
+MMEngine 0.10.7 会在每个 work dir 根目录保存以原配置 basename 命名的展开
+配置。以下严格 block 检查三个 checkpoint、三份实际运行配置和所有日志；
+Python 部分只使用标准库解析配置快照，不依赖 `rg` 或训练框架导入。
+
+```bash
+(
+set -euo pipefail
+
+SMOKE_DIRS=(
+  work_dirs/r50_fpn_kitti_2d_accum_smoke
+  work_dirs/transfusion_l_kitti_accum_smoke
+  work_dirs/transfusion_lc_kitti_accum_smoke
+)
+for path in "${SMOKE_DIRS[@]}"; do
+  if [[ ! -f "$path/epoch_1.pth" ]]; then
+    printf 'ERROR: smoke checkpoint is missing: %s/epoch_1.pth\n' \
+      "$path" >&2
+    exit 1
+  fi
+done
+
+python - <<'PY'
+import ast
+from pathlib import Path
+
+
+def assignment(tree, name, path):
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == name
+               for target in node.targets):
+            return node.value
+    raise AssertionError(f'{path}: missing top-level assignment {name}')
+
+
+def mapping_item(node, key, path, mapping_name):
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == 'dict'):
+        for keyword in node.keywords:
+            if keyword.arg == key:
+                return ast.literal_eval(keyword.value)
+    elif isinstance(node, ast.Dict):
+        for key_node, value_node in zip(node.keys, node.values):
+            if ast.literal_eval(key_node) == key:
+                return ast.literal_eval(value_node)
+    raise AssertionError(f'{path}: missing {mapping_name}.{key}')
+
+
+checks = (
+    (Path('work_dirs/r50_fpn_kitti_2d_accum_smoke/'
+          'r50_fpn_kitti_2d.py'), 4),
+    (Path('work_dirs/transfusion_l_kitti_accum_smoke/'
+          'transfusion_l_kitti.py'), 8),
+    (Path('work_dirs/transfusion_lc_kitti_accum_smoke/'
+          'transfusion_lc_kitti.py'), 8),
+)
+for path, expected in checks:
+    if not path.is_file():
+        raise AssertionError(f'missing MMEngine config snapshot: {path}')
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    actual = mapping_item(
+        assignment(tree, 'optim_wrapper', path),
+        'accumulative_counts', path, 'optim_wrapper')
+    assert actual == expected, (
+        f'{path}: accumulative_counts={actual}, expected {expected}')
+    if expected == 8 and path.name == 'transfusion_lc_kitti.py':
+        enabled = mapping_item(
+            assignment(tree, 'auto_scale_lr', path),
+            'enable', path, 'auto_scale_lr')
+        assert enabled is False, f'{path}: auto_scale_lr.enable={enabled}'
+    print(f'PASS: {path} accumulative_counts={actual}')
+PY
+
+mapfile -d '' STAGE0_LOGS < <(
+  find work_dirs/r50_fpn_kitti_2d_accum_smoke \
+    -type f -name '*.log' -print0
+)
+if (( ${#STAGE0_LOGS[@]} == 0 )); then
+  printf 'ERROR: no Stage 0 smoke .log files found\n' >&2
+  exit 1
+fi
+mapfile -d '' STAGE1_LOGS < <(
+  find work_dirs/transfusion_l_kitti_accum_smoke \
+    -type f -name '*.log' -print0
+)
+if (( ${#STAGE1_LOGS[@]} == 0 )); then
+  printf 'ERROR: no Stage 1 smoke .log files found\n' >&2
+  exit 1
+fi
+mapfile -d '' STAGE2_LOGS < <(
+  find work_dirs/transfusion_lc_kitti_accum_smoke \
+    -type f -name '*.log' -print0
+)
+if (( ${#STAGE2_LOGS[@]} == 0 )); then
+  printf 'ERROR: no Stage 2 smoke .log files found\n' >&2
+  exit 1
+fi
+ALL_LOGS=(
+  "${STAGE0_LOGS[@]}"
+  "${STAGE1_LOGS[@]}"
+  "${STAGE2_LOGS[@]}"
+)
+
+require_log_pattern() {
+  local description=$1
+  local pattern=$2
+  shift 2
+  local status
+  set +e
+  grep -EinE -- "$pattern" "$@"
+  status=$?
+  set -e
+  if (( status == 1 )); then
+    printf 'ERROR: missing %s in smoke logs\n' "$description" >&2
+    exit 1
+  fi
+  if (( status != 0 )); then
+    printf 'ERROR: grep failed while checking %s (status=%s)\n' \
+      "$description" "$status" >&2
+    exit 1
+  fi
+}
+
+reject_log_pattern() {
+  local description=$1
+  local pattern=$2
+  shift 2
+  local status
+  set +e
+  grep -EinE -- "$pattern" "$@"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    printf 'ERROR: detected %s in smoke logs\n' "$description" >&2
+    exit 1
+  fi
+  if (( status != 1 )); then
+    printf 'ERROR: grep failed while checking %s (status=%s)\n' \
+      "$description" "$status" >&2
+    exit 1
+  fi
+}
+
+NUMERIC='[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?'
+require_log_pattern 'Stage 0 numeric training loss' \
+  "Epoch\\(train\\).*loss[^:=,[:space:]]*[[:space:]]*:[[:space:]]*$NUMERIC([^[:alnum:]_.+-]|$)" \
+  "${STAGE0_LOGS[@]}"
+require_log_pattern 'Stage 1 numeric training loss' \
+  "Epoch\\(train\\).*loss[^:=,[:space:]]*[[:space:]]*:[[:space:]]*$NUMERIC([^[:alnum:]_.+-]|$)" \
+  "${STAGE1_LOGS[@]}"
+require_log_pattern 'Stage 2 numeric training loss' \
+  "Epoch\\(train\\).*loss[^:=,[:space:]]*[[:space:]]*:[[:space:]]*$NUMERIC([^[:alnum:]_.+-]|$)" \
+  "${STAGE2_LOGS[@]}"
+require_log_pattern 'Stage 0 final iteration 4/4' \
+  'Epoch\(train\)[[:space:]]+\[1\]\[4/4\]' \
+  "${STAGE0_LOGS[@]}"
+require_log_pattern 'Stage 1 final iteration 8/8' \
+  'Epoch\(train\)[[:space:]]+\[1\]\[8/8\]' \
+  "${STAGE1_LOGS[@]}"
+require_log_pattern 'Stage 2 final iteration 8/8' \
+  'Epoch\(train\)[[:space:]]+\[1\]\[8/8\]' \
+  "${STAGE2_LOGS[@]}"
+require_log_pattern 'Stage 1 numeric grad_norm' \
+  "Epoch\\(train\\).*grad_norm[[:space:]]*:[[:space:]]*$NUMERIC([^[:alnum:]_.+-]|$)" \
+  "${STAGE1_LOGS[@]}"
+require_log_pattern 'Stage 2 numeric grad_norm' \
+  "Epoch\\(train\\).*grad_norm[[:space:]]*:[[:space:]]*$NUMERIC([^[:alnum:]_.+-]|$)" \
+  "${STAGE2_LOGS[@]}"
+reject_log_pattern 'non-finite loss/grad_norm' \
+  '(loss[^:=,[:space:]]*|grad_norm)["]?[[:space:]]*[:=][[:space:]]*[-+]?(nan|inf(inity)?)([^[:alpha:]]|$)' \
+  "${ALL_LOGS[@]}"
+reject_log_pattern 'automatic LR scaling' \
+  'LR is set based on batch size|Scaling the original LR|automatically scaling (the )?(original )?(LR|learning rate)' \
+  "${STAGE2_LOGS[@]}"
+reject_log_pattern 'middle_encoder/backbone size mismatch' \
+  '(middle_encoder|backbone).*size mismatch|size mismatch.*(middle_encoder|backbone)' \
+  "${ALL_LOGS[@]}"
+
+printf 'PASS: all three accumulation smoke artifacts and logs accepted\n'
+)
+```
+
+Stage 1/2 配置显式启用了 `clip_grad`，因此必须有数值 `grad_norm` 证据。
+Stage 0 继承的 Faster R-CNN `OptimWrapper` 没有 `clip_grad`，日志通常不输出
+`grad_norm`；Stage 0 以数值 loss、`4/4` 迭代记录、配置快照和
+`epoch_1.pth` 联合验收，不得为了 smoke 临时添加 `clip_grad`。
+
+只有 preflight、零 skip 测试、编译、三阶段训练和 acceptance block 全部通过，
+才能把 H800 gradient-accumulation smoke 标记为“已验证”并启动 formal run1。
+任一阶段 OOM 时先保留原目录和日志，不得通过删除失败证据后重跑来掩盖问题。
+允许评估的唯一 micro-batch/accumulation 备选是 Stage 0 `2/8`、Stage 1
+`3/16`、Stage 2 `1/16`；任何改变都必须记录实际配置和 commit，并在同组正式
+实验的所有 seed 中保持一致，不能只对某一次运行临时改值。
