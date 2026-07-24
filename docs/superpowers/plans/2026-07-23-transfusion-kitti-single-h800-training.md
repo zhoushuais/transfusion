@@ -484,6 +484,16 @@ for path in "${SMOKE_DIRS[@]}"; do
   fi
 done
 
+for checkpoint in \
+  checkpoints/faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth \
+  checkpoints/transfusion_kitti_stage2_init.pth; do
+  if [[ ! -f "$checkpoint" ]]; then
+    printf 'ERROR: required local smoke checkpoint is missing: %s\n' \
+      "$checkpoint" >&2
+    exit 1
+  fi
+done
+
 mkdir -p work_dirs
 CURRENT_SHA=$(git rev-parse HEAD)
 printf '%s\n' "$CURRENT_SHA" | \
