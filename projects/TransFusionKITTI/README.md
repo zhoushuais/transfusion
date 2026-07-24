@@ -572,7 +572,7 @@ micro iteration 完成一次 optimizer update 并保存 checkpoint。smoke AP �
 (
 set -euo pipefail
 
-EXPECTED_BRANCH=codex/transfusion-kitti-h800-training
+EXPECTED_BRANCH=codex/transfusion-kitti-port
 REVIEWED_BASELINE=29837e49267312d7d34dfbae75d88fb110cfd0f0
 ACTUAL_BRANCH=$(git branch --show-current)
 if [[ "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]]; then

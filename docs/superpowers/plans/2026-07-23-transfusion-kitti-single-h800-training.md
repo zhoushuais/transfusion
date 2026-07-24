@@ -450,7 +450,7 @@ without expanding the config/test implementation set.
 (
 set -euo pipefail
 
-EXPECTED_BRANCH=codex/transfusion-kitti-h800-training
+EXPECTED_BRANCH=codex/transfusion-kitti-port
 REVIEWED_BASELINE=29837e49267312d7d34dfbae75d88fb110cfd0f0
 ACTUAL_BRANCH=$(git branch --show-current)
 if [[ "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]]; then
@@ -501,7 +501,7 @@ printf '%s\n' "$CURRENT_SHA" | \
 )
 ```
 
-Expected: branch is `codex/transfusion-kitti-h800-training`, the complete porcelain
+Expected: branch is `codex/transfusion-kitti-port`, the complete porcelain
 status (including non-ignored untracked files) is empty,
 and all three directories are absent. `29837e49` is the reviewed config/test/runbook
 minimum baseline, not a self-referential requirement that current `HEAD` equal that SHA;
