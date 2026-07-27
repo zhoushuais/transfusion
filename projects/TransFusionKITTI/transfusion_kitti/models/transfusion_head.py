@@ -886,11 +886,8 @@ class TransFusionKITTIHead(nn.Module):
                                       device=device)
                 center_int = center.to(torch.int32)
 
-                # original
-                # draw_heatmap_gaussian(heatmap[gt_labels_3d[idx]], center_int, radius) # noqa: E501
-                # NOTE: fix
                 draw_heatmap_gaussian(heatmap[gt_labels_3d[idx]],
-                                      center_int[[1, 0]], radius)
+                                      center_int, radius)
 
         mean_iou = ious[pos_inds].sum() / max(len(pos_inds), 1)
         return (
