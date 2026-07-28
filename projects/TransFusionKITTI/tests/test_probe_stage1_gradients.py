@@ -1,7 +1,11 @@
+# flake8: noqa: E402
 import copy
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 pytest.importorskip('mmengine')
@@ -23,6 +27,30 @@ def test_parser_requires_checkpoint_and_output():
     assert args.seed == 0
 
 
+def test_script_help_runs_from_repository_root():
+    repository_root = Path(__file__).resolve().parents[3]
+    script = repository_root / (
+        'projects/TransFusionKITTI/tools/probe_stage1_gradients.py')
+    result = subprocess.run(
+        [sys.executable, str(script), '--help'],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert '--checkpoint' in result.stdout
+
+
+def test_ensure_repository_root_on_path_prepends_root():
+    search_path = ['existing']
+    root = probe.ensure_repository_root_on_path(search_path)
+    assert root == Path(__file__).resolve().parents[3]
+    assert search_path == [str(root), 'existing']
+    probe.ensure_repository_root_on_path(search_path)
+    assert search_path.count(str(root)) == 1
+
+
 def test_validate_probe_config_accepts_only_fp32_stage1():
     cfg = ConfigDict(
         class_names=('Pedestrian', 'Cyclist', 'Car'),
@@ -39,6 +67,10 @@ def test_validate_probe_config_accepts_only_fp32_stage1():
     probe.validate_probe_config(cfg)
     cfg.optim_wrapper.type = 'AmpOptimWrapper'
     with pytest.raises(ValueError, match='FP32'):
+        probe.validate_probe_config(cfg)
+    cfg.optim_wrapper.type = 'OptimWrapper'
+    cfg.optim_wrapper.optimizer.type = 'SGD'
+    with pytest.raises(ValueError, match='AdamW'):
         probe.validate_probe_config(cfg)
 
 
@@ -67,7 +99,22 @@ def test_validate_paths_requires_real_config_and_checkpoint(tmp_path: Path):
     config = tmp_path / 'config.py'
     config.write_text('model = dict()', encoding='utf-8')
     with pytest.raises(FileNotFoundError, match='checkpoint'):
-        probe.validate_paths(config, tmp_path / 'missing.pth')
+        probe.validate_paths(
+            config, tmp_path / 'missing.pth', tmp_path / 'probe.json')
+
+
+def test_validate_paths_rejects_unsafe_output(tmp_path: Path):
+    config = tmp_path / 'config.py'
+    checkpoint = tmp_path / 'epoch_5.pth'
+    config.write_text('model = dict()', encoding='utf-8')
+    checkpoint.write_text('checkpoint', encoding='utf-8')
+    with pytest.raises(ValueError, match='must not overwrite'):
+        probe.validate_paths(config, checkpoint, config)
+    with pytest.raises(ValueError, match='must not overwrite'):
+        probe.validate_paths(config, checkpoint, checkpoint)
+    with pytest.raises(ValueError, match='JSON'):
+        probe.validate_paths(config, checkpoint, tmp_path / 'probe.txt')
+    probe.validate_paths(config, checkpoint, tmp_path / 'probe.json')
 
 
 try:
@@ -84,6 +131,50 @@ def test_summary_reports_values_and_rejects_nonfinite():
     }
     with pytest.raises(RuntimeError, match='NaN or Inf'):
         probe._summary([float('nan')])
+
+
+def test_grouped_overall_uses_only_masked_values():
+    class ArrayTensor:
+
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def __getitem__(self, index):
+            if isinstance(index, ArrayTensor):
+                index = index.values
+            return ArrayTensor(self.values[index])
+
+        def detach(self):
+            return self
+
+        def float(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def flatten(self):
+            return ArrayTensor(self.values.flatten())
+
+        def tolist(self):
+            return self.values.tolist()
+
+    values = ArrayTensor([[
+        [[0.8, 0.2]],
+        [[0.3, 0.4]],
+        [[0.5, 0.6]],
+    ]])
+    masks = ArrayTensor([[
+        [[True, False]],
+        [[False, False]],
+        [[False, True]],
+    ]])
+    result = probe._grouped(values, masks)
+    assert result['overall']['count'] == 2
+    assert result['overall']['mean'] == pytest.approx(0.7)
+    assert result['by_class']['Pedestrian']['mean'] == pytest.approx(0.8)
+    assert result['by_class']['Cyclist']['count'] == 0
+    assert result['by_class']['Car']['mean'] == pytest.approx(0.6)
 
 
 @requires_torch
@@ -162,6 +253,8 @@ def _valid_state_result():
         optimizer_membership={'weight': True},
         heatmap_only_gradients=dict(nonfinite_count=0, overall_norm=1.0),
         total_gradients=dict(nonfinite_count=0, overall_norm=1.0),
+        optimizer_preclip_gradients=dict(
+            nonfinite_count=0, overall_norm=1.0),
         parameter_delta=dict(
             all_zero=False, overall_norm=0.1, nonfinite_count=0),
         heatmap=dict(
@@ -188,6 +281,8 @@ def test_validate_state_result_rejects_zero_delta():
         (('losses', 'total'), float('nan'), 'loss contains'),
         (('parameter_delta', 'nonfinite_count'), 1,
          'parameter delta contains'),
+        (('optimizer_preclip_gradients', 'nonfinite_count'), 1,
+         'optimizer_preclip_gradients contains'),
     ],
 )
 def test_validate_state_result_rejects_invalid_numeric_or_grad_state(
@@ -242,3 +337,59 @@ def test_build_batch_summary_requires_matching_targets():
     checkpoint['heatmap']['positive_centers']['overall'] = 5
     with pytest.raises(RuntimeError, match='batch targets differ'):
         probe.build_batch_summary(fresh, checkpoint)
+
+
+def test_forward_losses_preserves_logits_before_inplace_loss_mutation():
+    class EmptyLabels:
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def tolist(self):
+            return []
+
+    class MutableHeatmap:
+
+        def __init__(self, value):
+            self.value = value
+
+        def clone(self):
+            return MutableHeatmap(self.value)
+
+    class FakeHead:
+
+        def __init__(self):
+            self.heatmap = MutableHeatmap(2.0)
+
+        def __call__(self, features, metas):
+            return [[{'dense_heatmap': self.heatmap}]]
+
+        def get_targets(self, gt_instances, predictions):
+            return ('target',)
+
+        def loss_by_feat(self, predictions, gt_instances):
+            predictions[0][0]['dense_heatmap'].value = 0.75
+            return {'loss_heatmap': 1.0}
+
+    class FakeModel:
+
+        def __init__(self):
+            self.bbox_head = FakeHead()
+
+        def data_preprocessor(self, raw_batch, training):
+            sample = SimpleNamespace(
+                metainfo={},
+                gt_instances_3d=SimpleNamespace(labels_3d=EmptyLabels()),
+            )
+            return {'inputs': 'inputs', 'data_samples': [sample]}
+
+        def extract_feat(self, inputs):
+            return 'features'
+
+    model = FakeModel()
+    _, dense_logits, _, _ = probe._forward_losses(model, {})
+    assert model.bbox_head.heatmap.value == 0.75
+    assert dense_logits.value == 2.0

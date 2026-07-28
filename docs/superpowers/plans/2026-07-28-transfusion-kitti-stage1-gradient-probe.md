@@ -100,7 +100,8 @@ def test_validate_paths_requires_real_config_and_checkpoint(tmp_path: Path):
     config = tmp_path / 'config.py'
     config.write_text('model = dict()', encoding='utf-8')
     with pytest.raises(FileNotFoundError, match='checkpoint'):
-        probe.validate_paths(config, tmp_path / 'missing.pth')
+        probe.validate_paths(
+            config, tmp_path / 'missing.pth', tmp_path / 'probe.json')
 ```
 
 - [ ] **Step 2: Run the tests and verify the module is missing**
@@ -139,17 +140,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_paths(config: Path, checkpoint: Path) -> None:
+def validate_paths(config: Path, checkpoint: Path, output: Path) -> None:
     if not config.is_file():
         raise FileNotFoundError(f'config does not exist: {config}')
     if not checkpoint.is_file():
         raise FileNotFoundError(f'checkpoint does not exist: {checkpoint}')
+    if output.resolve(strict=False) in {
+            config.resolve(strict=False), checkpoint.resolve(strict=False)}:
+        raise ValueError('output must not overwrite config or checkpoint')
+    if output.suffix.lower() != '.json':
+        raise ValueError('output must be a JSON file with a .json suffix')
 
 
 def validate_probe_config(cfg) -> None:
     validate_stage1_config(cfg)
     if cfg.optim_wrapper.get('type', 'OptimWrapper') != 'OptimWrapper':
         raise ValueError('Stage 1 gradient probe requires FP32 OptimWrapper')
+    if cfg.optim_wrapper.optimizer.get('type') != 'AdamW':
+        raise ValueError('Stage 1 gradient probe requires AdamW optimizer')
     if int(cfg.train_dataloader.get('batch_size', -1)) <= 0:
         raise ValueError('train_dataloader.batch_size must be positive')
     if int(cfg.optim_wrapper.get('accumulative_counts', 1)) <= 0:
@@ -295,7 +303,7 @@ def _summary(values) -> dict:
 
 
 def _grouped(values, masks) -> dict:
-    flat = values.detach().float().cpu().flatten()
+    flat = values[masks].detach().float().cpu().flatten()
     return dict(
         overall=_summary(flat.tolist()),
         by_class={
@@ -505,7 +513,10 @@ def validate_state_result(result: dict) -> None:
         raise RuntimeError('heatmap target contains NaN or Inf')
     if result['heatmap']['nonfinite_logit_count']:
         raise RuntimeError('heatmap logits contain NaN or Inf')
-    for key in ('heatmap_only_gradients', 'total_gradients'):
+    for key in (
+            'heatmap_only_gradients',
+            'total_gradients',
+            'optimizer_preclip_gradients'):
         if result[key]['nonfinite_count']:
             raise RuntimeError(f'{key} contains NaN or Inf')
     if result['parameter_delta']['nonfinite_count']:
@@ -528,8 +539,8 @@ def _forward_losses(model, raw_batch):
     predictions = model.bbox_head(features, metas)
     gt_instances = [sample.gt_instances_3d for sample in data_samples]
     targets = model.bbox_head.get_targets(gt_instances, predictions[0])
+    dense_logits = predictions[0][0]['dense_heatmap'].clone()
     losses = model.bbox_head.loss_by_feat(predictions, gt_instances)
-    dense_logits = predictions[0][0]['dense_heatmap']
     return (
         losses,
         dense_logits,
@@ -765,7 +776,7 @@ def run(args) -> dict:
     from mmengine.runner import Runner, set_random_seed
     from mmengine.utils import import_modules_from_strings
 
-    validate_paths(args.config, args.checkpoint)
+    validate_paths(args.config, args.checkpoint, args.output)
     cfg = Config.fromfile(str(args.config))
     if cfg.get('custom_imports'):
         import_modules_from_strings(**cfg.custom_imports)

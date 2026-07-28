@@ -8,9 +8,24 @@ from pathlib import Path
 import statistics
 from typing import Mapping
 
-from projects.TransFusionKITTI.tools.diagnose_stage1 import (
-    validate_stage1_config,
-)
+
+def ensure_repository_root_on_path(search_path) -> Path:
+    repository_root = Path(__file__).resolve().parents[3]
+    repository_root_string = str(repository_root)
+    if repository_root_string not in search_path:
+        search_path.insert(0, repository_root_string)
+    return repository_root
+
+
+if __package__:
+    from .diagnose_stage1 import validate_stage1_config
+else:
+    import sys
+
+    ensure_repository_root_on_path(sys.path)
+    from projects.TransFusionKITTI.tools.diagnose_stage1 import (
+        validate_stage1_config,
+    )
 
 
 CLASS_NAMES = ('Pedestrian', 'Cyclist', 'Car')
@@ -26,17 +41,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_paths(config: Path, checkpoint: Path) -> None:
+def validate_paths(config: Path, checkpoint: Path, output: Path) -> None:
     if not config.is_file():
         raise FileNotFoundError(f'config does not exist: {config}')
     if not checkpoint.is_file():
         raise FileNotFoundError(f'checkpoint does not exist: {checkpoint}')
+    resolved_output = output.resolve(strict=False)
+    protected_paths = {
+        config.resolve(strict=False),
+        checkpoint.resolve(strict=False),
+    }
+    if resolved_output in protected_paths:
+        raise ValueError('output must not overwrite config or checkpoint')
+    if output.suffix.lower() != '.json':
+        raise ValueError('output must be a JSON file with a .json suffix')
 
 
 def validate_probe_config(cfg) -> None:
     validate_stage1_config(cfg)
     if cfg.optim_wrapper.get('type', 'OptimWrapper') != 'OptimWrapper':
         raise ValueError('Stage 1 gradient probe requires FP32 OptimWrapper')
+    optimizer_cfg = cfg.optim_wrapper.get('optimizer', {})
+    if optimizer_cfg.get('type') != 'AdamW':
+        raise ValueError('Stage 1 gradient probe requires AdamW optimizer')
     if int(cfg.train_dataloader.get('batch_size', -1)) <= 0:
         raise ValueError('train_dataloader.batch_size must be positive')
     if int(cfg.optim_wrapper.get('accumulative_counts', 1)) <= 0:
@@ -67,7 +94,7 @@ def _summary(values) -> dict:
 
 
 def _grouped(values, masks) -> dict:
-    flat = values.detach().float().cpu().flatten()
+    flat = values[masks].detach().float().cpu().flatten()
     return dict(
         overall=_summary(flat.tolist()),
         by_class={
@@ -216,12 +243,16 @@ def validate_state_result(result: dict) -> None:
     if not all(result['optimizer_membership'].values()):
         raise RuntimeError('heatmap head parameter is missing from optimizer')
     if result['heatmap']['positive_centers']['overall'] <= 0:
-        raise RuntimeError('training batch contains no heatmap positive center')
+        raise RuntimeError(
+            'training batch contains no heatmap positive center')
     if result['heatmap']['nonfinite_target_count']:
         raise RuntimeError('heatmap target contains NaN or Inf')
     if result['heatmap']['nonfinite_logit_count']:
         raise RuntimeError('heatmap logits contain NaN or Inf')
-    for key in ('heatmap_only_gradients', 'total_gradients'):
+    for key in (
+            'heatmap_only_gradients',
+            'total_gradients',
+            'optimizer_preclip_gradients'):
         if result[key]['nonfinite_count']:
             raise RuntimeError(f'{key} contains NaN or Inf')
     if result['parameter_delta']['nonfinite_count']:
@@ -239,8 +270,8 @@ def _forward_losses(model, raw_batch):
     predictions = model.bbox_head(features, metas)
     gt_instances = [sample.gt_instances_3d for sample in data_samples]
     targets = model.bbox_head.get_targets(gt_instances, predictions[0])
+    dense_logits = predictions[0][0]['dense_heatmap'].clone()
     losses = model.bbox_head.loss_by_feat(predictions, gt_instances)
-    dense_logits = predictions[0][0]['dense_heatmap']
     return (
         losses,
         dense_logits,
@@ -309,6 +340,7 @@ def probe_model_state(model, optim_wrapper, raw_batch) -> dict:
         heatmap=heatmap,
         heatmap_only_gradients=dict(nonfinite_count=0),
         total_gradients=dict(nonfinite_count=0),
+        optimizer_preclip_gradients=dict(nonfinite_count=0),
         parameter_delta=dict(nonfinite_count=0, all_zero=False),
     )
     validate_state_result(preflight)
@@ -437,10 +469,11 @@ def write_report(result: dict, output: Path) -> None:
 def print_summary(result: dict, output: Path) -> None:
     for name in ('fresh', 'checkpoint'):
         state = result[name]
+        positive = state[
+            'heatmap']['positive_probability']['overall']['mean']
         print(
             f'{name}: loss_heatmap={state["losses"]["loss_heatmap"]:.6f} '
-            f'positive_probability='
-            f'{state["heatmap"]["positive_probability"]["overall"]["mean"]:.6f} '
+            f'positive_probability={positive:.6f} '
             f'heatmap_grad='
             f'{state["heatmap_only_gradients"]["overall_norm"]:.6f} '
             f'parameter_delta='
@@ -480,7 +513,7 @@ def run(args) -> dict:
     from mmengine.runner import Runner, set_random_seed
     from mmengine.utils import import_modules_from_strings
 
-    validate_paths(args.config, args.checkpoint)
+    validate_paths(args.config, args.checkpoint, args.output)
     cfg = Config.fromfile(str(args.config))
     if cfg.get('custom_imports'):
         import_modules_from_strings(**cfg.custom_imports)
