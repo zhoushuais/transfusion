@@ -108,6 +108,22 @@ def test_strict_iou_threshold_uses_kitti_class_contract():
         diagnose_stage1.strict_iou_threshold(3)
 
 
+def test_unwrap_prediction_requires_expected_single_level_shape():
+    prediction = {'heatmap': object()}
+
+    assert diagnose_stage1.unwrap_prediction(([prediction],)) is prediction
+    with pytest.raises(RuntimeError, match='single-level'):
+        diagnose_stage1.unwrap_prediction(([],))
+
+
+def test_validate_feature_map_shape_rejects_config_drift():
+    train_cfg = dict(grid_size=[1408, 1600, 40], out_size_factor=8)
+
+    diagnose_stage1.validate_feature_map_shape((200, 176), train_cfg)
+    with pytest.raises(RuntimeError, match='feature map shape'):
+        diagnose_stage1.validate_feature_map_shape((176, 200), train_cfg)
+
+
 @requires_torch
 def test_flat_indices_restore_xy_on_non_square_map():
     indices = torch.tensor([0, 4, 5, 13])
@@ -199,3 +215,31 @@ def test_build_match_record_uses_assigned_query_gt_pairs():
     assert record['query_label_match'].tolist() == [True, False]
     assert record['strict_iou_pass'].tolist() == [True, False]
     assert record['final_gt_score'][1].item() == 0.0
+
+
+@requires_torch
+def test_verify_query_reconstruction_rejects_coordinate_drift():
+    selected = dict(
+        labels=torch.tensor([[0, 1]]),
+        class_scores=torch.tensor([[[0.8, 0.2], [0.1, 0.7]]]),
+    )
+    prediction = dict(
+        query_labels=torch.tensor([[1, 0]]),
+        query_heatmap_score=selected['class_scores'],
+    )
+
+    with pytest.raises(RuntimeError, match='query labels'):
+        diagnose_stage1.verify_query_reconstruction(selected, prediction)
+
+
+@requires_torch
+def test_filter_target_ground_truth_removes_negative_labels():
+    boxes = torch.arange(21, dtype=torch.float32).reshape(3, 7)
+    labels = torch.tensor([0, -1, 2])
+
+    filtered_boxes, filtered_labels, ignored = (
+        diagnose_stage1.filter_target_ground_truth(boxes, labels))
+
+    assert filtered_labels.tolist() == [0, 2]
+    torch.testing.assert_close(filtered_boxes, boxes[[0, 2]])
+    assert ignored == 1

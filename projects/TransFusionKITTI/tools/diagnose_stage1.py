@@ -216,3 +216,155 @@ def build_match_record(
         decoder_gt_score=decoder_score,
         final_gt_score=final_score,
     )
+
+
+def unwrap_prediction(raw_output) -> dict:
+    if (not isinstance(raw_output, tuple) or len(raw_output) != 1 or
+            not isinstance(raw_output[0], list) or len(raw_output[0]) != 1):
+        raise RuntimeError('expected a single-level TransFusion prediction')
+    return raw_output[0][0]
+
+
+def validate_feature_map_shape(actual_shape, train_cfg) -> None:
+    expected_shape = (
+        int(train_cfg['grid_size'][1] // train_cfg['out_size_factor']),
+        int(train_cfg['grid_size'][0] // train_cfg['out_size_factor']),
+    )
+    if tuple(actual_shape) != expected_shape:
+        raise RuntimeError(
+            f'feature map shape {tuple(actual_shape)} does not match '
+            f'config-derived shape {expected_shape}')
+
+
+def verify_query_reconstruction(selected: dict, prediction: dict) -> None:
+    import torch
+
+    if not torch.equal(selected['labels'], prediction['query_labels']):
+        raise RuntimeError('reconstructed query labels differ from production')
+    try:
+        torch.testing.assert_close(
+            selected['class_scores'],
+            prediction['query_heatmap_score'],
+            atol=1e-6,
+            rtol=1e-5,
+        )
+    except AssertionError as error:
+        raise RuntimeError(
+            'reconstructed query scores differ from production') from error
+
+
+def filter_target_ground_truth(boxes, labels):
+    valid = (labels >= 0) & (labels < len(CLASS_NAMES))
+    ignored = int((~valid).sum().item())
+    return boxes[valid], labels[valid], ignored
+
+
+def gt_centers_to_cells(gt_boxes, train_cfg):
+    centers = gt_boxes[:, :2]
+    pc_range = centers.new_tensor(train_cfg['point_cloud_range'][:2])
+    voxel_size = centers.new_tensor(train_cfg['voxel_size'][:2])
+    return (centers - pc_range) / voxel_size / train_cfg['out_size_factor']
+
+
+def diagnose_batch(model, batch: dict) -> dict:
+    import torch
+    from mmengine.structures import InstanceData
+
+    inputs = batch['inputs']
+    data_samples = batch['data_samples']
+    if len(data_samples) != 1:
+        raise RuntimeError('diagnostics require batch_size=1')
+    sample = data_samples[0]
+    metas = [sample.metainfo]
+
+    raw_output = model(inputs, data_samples, mode='tensor')
+    prediction = unwrap_prediction(raw_output)
+    required = {
+        'dense_heatmap',
+        'heatmap',
+        'center',
+        'height',
+        'dim',
+        'rot',
+        'query_labels',
+        'query_heatmap_score',
+    }
+    missing = required.difference(prediction)
+    if missing:
+        raise RuntimeError(f'prediction is missing keys: {sorted(missing)}')
+    for name in required:
+        _require_finite(name, prediction[name])
+
+    prediction_device = prediction['center'].device
+    raw_gt = sample.gt_instances_3d
+    gt_boxes = raw_gt.bboxes_3d.tensor.to(prediction_device)
+    gt_labels = raw_gt.labels_3d.to(prediction_device)
+    gt_boxes, gt_labels, ignored_gt_count = filter_target_ground_truth(
+        gt_boxes, gt_labels)
+
+    head = model.bbox_head
+    dense_probability = prediction['dense_heatmap'].sigmoid()
+    validate_feature_map_shape(dense_probability.shape[-2:], head.train_cfg)
+    localized = head._local_max_heatmap(dense_probability)
+    selected = select_queries(localized, head.num_proposals)
+    verify_query_reconstruction(selected, prediction)
+
+    gt_xy = gt_centers_to_cells(gt_boxes, head.train_cfg)
+    height, width = dense_probability.shape[-2:]
+    if ((gt_xy[:, 0] < 0).any() or (gt_xy[:, 0] >= width).any() or
+            (gt_xy[:, 1] < 0).any() or (gt_xy[:, 1] >= height).any()):
+        raise RuntimeError('filtered GT center is outside the feature map')
+    gt_int = gt_xy.to(torch.long)
+    dense_gt_score = dense_probability[
+        0, gt_labels, gt_int[:, 1], gt_int[:, 0]]
+    query_record = query_metrics(
+        selected['xy'][0], selected['labels'][0], gt_xy, gt_labels)
+
+    num_proposals = head.num_proposals
+    decoder_logits = prediction['heatmap'][..., -num_proposals:]
+    decoded = head.bbox_coder.decode(
+        decoder_logits.detach(),
+        prediction['rot'][..., -num_proposals:].detach(),
+        prediction['dim'][..., -num_proposals:].detach(),
+        prediction['center'][..., -num_proposals:].detach(),
+        prediction['height'][..., -num_proposals:].detach(),
+        filter=False,
+    )[0]['bboxes']
+    _require_finite('decoded boxes', decoded)
+    pred_instances = InstanceData(
+        bboxes=decoded,
+        scores=decoder_logits[0].transpose(0, 1),
+    )
+    gt_instances = InstanceData(bboxes=gt_boxes, labels=gt_labels)
+    assignment = head.bbox_assigner.assign(
+        pred_instances, gt_instances, head.train_cfg)
+    match_record = build_match_record(
+        decoded,
+        gt_boxes,
+        gt_labels,
+        prediction['query_labels'][0],
+        decoder_logits,
+        prediction['query_heatmap_score'],
+        assignment,
+    )
+    final_prediction = head.predict_by_feat(raw_output, metas)[0]
+    return dict(
+        gt_labels=gt_labels.detach().cpu(),
+        ignored_gt_count=ignored_gt_count,
+        dense_gt_score=dense_gt_score.detach().cpu(),
+        nearest_query_distance=query_record['nearest_distance'].detach().cpu(),
+        query_recall={
+            radius: value.detach().cpu()
+            for radius, value in query_record['recall'].items()
+        },
+        no_same_class_query=query_record['no_same_class'].detach().cpu(),
+        query_labels=selected['labels'][0].detach().cpu(),
+        match={
+            key: value.detach().cpu() if isinstance(value, torch.Tensor) else
+            value
+            for key, value in match_record.items()
+        },
+        prediction_labels=final_prediction.labels_3d.detach().cpu(),
+        prediction_scores=final_prediction.scores_3d.detach().cpu(),
+        dense_shape=tuple(dense_probability.shape[-2:]),
+    )
