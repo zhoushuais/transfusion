@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import json
 import math
 from pathlib import Path
 import statistics
@@ -368,3 +369,233 @@ def diagnose_batch(model, batch: dict) -> dict:
         prediction_scores=final_prediction.scores_3d.detach().cpu(),
         dense_shape=tuple(dense_probability.shape[-2:]),
     )
+
+
+def _python_value(value):
+    if hasattr(value, 'detach'):
+        return value.detach().cpu().tolist()
+    if hasattr(value, 'tolist'):
+        return value.tolist()
+    return value
+
+
+def _values(records: list, key: str, nested: str = None) -> list:
+    combined = []
+    for record in records:
+        value = record[nested][key] if nested else record[key]
+        value = _python_value(value)
+        if isinstance(value, (list, tuple)):
+            combined.extend(value)
+        else:
+            combined.append(value)
+    return combined
+
+
+def grouped_summary(values, labels, class_names=CLASS_NAMES) -> dict:
+    values = list(values)
+    labels = [int(label) for label in labels]
+    if len(values) != len(labels):
+        raise ValueError('values and labels must have equal length')
+    return dict(
+        overall=numeric_summary(values),
+        by_class={
+            name: numeric_summary(
+                value for value, label in zip(values, labels)
+                if label == class_index)
+            for class_index, name in enumerate(class_names)
+        },
+    )
+
+
+def _counts(labels) -> dict:
+    labels = [int(label) for label in labels]
+    return dict(
+        overall=len(labels),
+        by_class={
+            name: sum(label == index for label in labels)
+            for index, name in enumerate(CLASS_NAMES)
+        },
+    )
+
+
+def aggregate_records(records: list) -> dict:
+    if not records:
+        raise ValueError('at least one diagnostic record is required')
+    gt_labels = _values(records, 'gt_labels')
+    match_labels = _values(records, 'gt_labels', nested='match')
+    prediction_labels = _values(records, 'prediction_labels')
+    nearest = _values(records, 'nearest_query_distance')
+    finite_nearest = [
+        (value, label) for value, label in zip(nearest, gt_labels)
+        if math.isfinite(float(value))
+    ]
+
+    decoder_matches = {}
+    for metric, axes in (
+        ('center_abs_error', ('x', 'y', 'z')),
+        ('dim_abs_error', ('dx', 'dy', 'dz')),
+    ):
+        rows = _values(records, metric, nested='match')
+        decoder_matches[metric] = {
+            axis: grouped_summary(
+                [row[axis_index] for row in rows], match_labels)
+            for axis_index, axis in enumerate(axes)
+        }
+    for metric in (
+        'yaw_abs_error',
+        'bev_iou',
+        'iou_3d',
+        'strict_iou_pass',
+        'query_label_match',
+    ):
+        decoder_matches[metric] = grouped_summary(
+            _values(records, metric, nested='match'), match_labels)
+
+    return dict(
+        ground_truth=dict(
+            count=_counts(gt_labels),
+            ignored_non_target_count=sum(
+                int(record['ignored_gt_count']) for record in records),
+        ),
+        dense_queries=dict(
+            gt_center_score=grouped_summary(
+                _values(records, 'dense_gt_score'), gt_labels),
+            nearest_same_class_distance_cells=grouped_summary(
+                [item[0] for item in finite_nearest],
+                [item[1] for item in finite_nearest],
+            ),
+            same_class_recall_cells={
+                str(int(radius)): grouped_summary(
+                    [value for record in records
+                     for value in _python_value(record['query_recall'][radius])],
+                    gt_labels,
+                )
+                for radius in RECALL_RADII
+            },
+            no_same_class_query=grouped_summary(
+                _values(records, 'no_same_class_query'), gt_labels),
+            query_class_count=_counts(_values(records, 'query_labels')),
+        ),
+        decoder_matches=decoder_matches,
+        scores=dict(
+            decoder_gt_class_score=grouped_summary(
+                _values(records, 'decoder_gt_score', nested='match'),
+                match_labels,
+            ),
+            final_gt_class_score=grouped_summary(
+                _values(records, 'final_gt_score', nested='match'),
+                match_labels,
+            ),
+            final_prediction_count=_counts(prediction_labels),
+            final_prediction_score=grouped_summary(
+                _values(records, 'prediction_scores'), prediction_labels),
+        ),
+    )
+
+
+def validate_max_samples(max_samples: int) -> None:
+    if max_samples <= 0:
+        raise ValueError('--max-samples must be positive')
+
+
+def write_report(result: dict, output: Path) -> None:
+    serialized = json.dumps(result, indent=2, allow_nan=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(serialized, encoding='utf-8')
+
+
+def print_summary(result: dict, output: Path) -> None:
+    dense = result['dense_queries']
+    matches = result['decoder_matches']
+    scores = result['scores']
+    print(
+        f"STAGE1_DIAGNOSTICS_OK samples="
+        f"{result['metadata']['processed_samples']}")
+    print('dense_gt_score:', dense['gt_center_score'])
+    print('query_recall_cells:', dense['same_class_recall_cells'])
+    print('matched_iou_3d:', matches['iou_3d'])
+    print('query_label_match:', matches['query_label_match'])
+    print('decoder_gt_score:', scores['decoder_gt_class_score'])
+    print('final_gt_score:', scores['final_gt_class_score'])
+    print(f'JSON: {output}')
+
+
+def run(args) -> dict:
+    validate_max_samples(args.max_samples)
+    validate_paths(args.config, args.checkpoint)
+
+    import torch
+    from mmengine.config import Config
+    from mmengine.registry import init_default_scope
+    from mmengine.runner import Runner
+    from mmengine.runner.checkpoint import load_checkpoint
+    from mmengine.utils import import_modules_from_strings
+
+    from mmdet3d.registry import MODELS
+
+    cfg = Config.fromfile(str(args.config))
+    if cfg.get('custom_imports'):
+        import_modules_from_strings(**cfg.custom_imports)
+    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
+    validate_stage1_config(cfg)
+
+    device = torch.device(args.device)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    model = MODELS.build(cfg.model)
+    model.init_weights()
+    load_checkpoint(
+        model,
+        str(args.checkpoint),
+        map_location='cpu',
+        strict=True,
+    )
+    model.to(device).eval()
+    dataloader = Runner.build_dataloader(
+        build_diagnostic_dataloader_cfg(cfg))
+
+    records = []
+    skipped_empty_samples = 0
+    with torch.no_grad():
+        for raw_batch in dataloader:
+            batch = model.data_preprocessor(raw_batch, training=False)
+            record = diagnose_batch(model, batch)
+            if len(record['gt_labels']) == 0:
+                skipped_empty_samples += 1
+                continue
+            records.append(record)
+            if len(records) == args.max_samples:
+                break
+    if not records:
+        raise RuntimeError('diagnostic subset contains no valid target GT')
+
+    dense_shapes = {tuple(record['dense_shape']) for record in records}
+    if len(dense_shapes) != 1:
+        raise RuntimeError(f'inconsistent feature map shapes: {dense_shapes}')
+    dense_shape = next(iter(dense_shapes))
+    result = dict(
+        metadata=dict(
+            config=str(args.config.resolve()),
+            checkpoint=str(args.checkpoint.resolve()),
+            device=str(device),
+            processed_samples=len(records),
+            skipped_empty_samples=skipped_empty_samples,
+            class_names=list(CLASS_NAMES),
+            bev_feature_shape=list(dense_shape),
+            voxel_size=list(cfg.voxel_size),
+            out_size_factor=int(cfg.out_size_factor),
+            point_cloud_range=list(cfg.point_cloud_range),
+        ),
+        **aggregate_records(records),
+    )
+    write_report(result, args.output)
+    print_summary(result, args.output)
+    return result
+
+
+def main() -> None:
+    run(build_parser().parse_args())
+
+
+if __name__ == '__main__':
+    main()

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import math
 from types import SimpleNamespace
 
@@ -122,6 +123,107 @@ def test_validate_feature_map_shape_rejects_config_drift():
     diagnose_stage1.validate_feature_map_shape((200, 176), train_cfg)
     with pytest.raises(RuntimeError, match='feature map shape'):
         diagnose_stage1.validate_feature_map_shape((176, 200), train_cfg)
+
+
+def test_grouped_summary_keeps_empty_class_json_safe():
+    result = diagnose_stage1.grouped_summary(
+        values=[0.2, 0.8],
+        labels=[0, 2],
+    )
+
+    assert result['overall']['count'] == 2
+    assert result['by_class']['Cyclist']['count'] == 0
+    assert result['by_class']['Cyclist']['mean'] is None
+    json.dumps(result, allow_nan=False)
+
+
+def test_aggregate_records_has_required_top_level_sections():
+    record = dict(
+        gt_labels=[0],
+        ignored_gt_count=2,
+        dense_gt_score=[0.4],
+        nearest_query_distance=[1.0],
+        query_recall={radius: [radius >= 1.0]
+                      for radius in diagnose_stage1.RECALL_RADII},
+        no_same_class_query=[False],
+        query_labels=[0, 2],
+        match=dict(
+            gt_labels=[0],
+            center_abs_error=[[1., 2., 3.]],
+            dim_abs_error=[[0.1, 0.2, 0.3]],
+            yaw_abs_error=[0.1],
+            bev_iou=[0.4],
+            iou_3d=[0.3],
+            strict_iou_pass=[False],
+            query_label_match=[True],
+            decoder_gt_score=[0.5],
+            final_gt_score=[0.25],
+        ),
+        prediction_labels=[0, 2],
+        prediction_scores=[0.4, 0.1],
+        dense_shape=(200, 176),
+    )
+
+    result = diagnose_stage1.aggregate_records([record])
+
+    assert set(result) == {
+        'ground_truth', 'dense_queries', 'decoder_matches', 'scores'
+    }
+    assert result['ground_truth']['count']['overall'] == 1
+    assert result['ground_truth']['ignored_non_target_count'] == 2
+    json.dumps(result, allow_nan=False)
+
+
+def test_aggregate_records_excludes_infinite_nearest_distance():
+    record = dict(
+        gt_labels=[1],
+        ignored_gt_count=0,
+        dense_gt_score=[0.2],
+        nearest_query_distance=[float('inf')],
+        query_recall={radius: [False]
+                      for radius in diagnose_stage1.RECALL_RADII},
+        no_same_class_query=[True],
+        query_labels=[0],
+        match=dict(
+            gt_labels=[1],
+            center_abs_error=[[1., 1., 1.]],
+            dim_abs_error=[[1., 1., 1.]],
+            yaw_abs_error=[1.],
+            bev_iou=[0.],
+            iou_3d=[0.],
+            strict_iou_pass=[False],
+            query_label_match=[False],
+            decoder_gt_score=[0.1],
+            final_gt_score=[0.],
+        ),
+        prediction_labels=[],
+        prediction_scores=[],
+        dense_shape=(200, 176),
+    )
+
+    result = diagnose_stage1.aggregate_records([record])
+
+    nearest = result['dense_queries']['nearest_same_class_distance_cells']
+    assert nearest['overall']['count'] == 0
+    assert result['dense_queries']['no_same_class_query']['overall'][
+        'mean'] == pytest.approx(1.0)
+    json.dumps(result, allow_nan=False)
+
+
+def test_validate_max_samples_requires_positive_value():
+    diagnose_stage1.validate_max_samples(1)
+    with pytest.raises(ValueError, match='positive'):
+        diagnose_stage1.validate_max_samples(0)
+
+
+def test_write_report_creates_parent_and_rejects_nan(tmp_path: Path):
+    output = tmp_path / 'nested' / 'report.json'
+
+    diagnose_stage1.write_report({'value': 1.5}, output)
+
+    assert json.loads(output.read_text(encoding='utf-8')) == {'value': 1.5}
+    with pytest.raises(ValueError):
+        diagnose_stage1.write_report({'value': float('nan')}, output)
 
 
 @requires_torch
