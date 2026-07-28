@@ -2,7 +2,10 @@
 
 import argparse
 import copy
+import math
 from pathlib import Path
+import statistics
+from typing import Iterable
 
 
 CLASS_NAMES = ('Pedestrian', 'Cyclist', 'Car')
@@ -70,3 +73,89 @@ def build_diagnostic_dataloader_cfg(cfg):
         ),
     ]
     return dataloader_cfg
+
+
+def _require_finite(name, value) -> None:
+    import torch
+
+    if value.is_floating_point() and not torch.isfinite(value).all():
+        raise RuntimeError(f'{name} contains NaN or Inf')
+
+
+def numeric_summary(values: Iterable[float]) -> dict:
+    values = [float(value) for value in values]
+    if not values:
+        return dict(count=0, mean=None, median=None, p90=None)
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError('summary values contain NaN or Inf')
+    ordered = sorted(values)
+    rank = 0.9 * (len(ordered) - 1)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    p90 = ordered[lower]
+    if upper != lower:
+        p90 += (ordered[upper] - ordered[lower]) * (rank - lower)
+    return dict(
+        count=len(ordered),
+        mean=float(statistics.fmean(ordered)),
+        median=float(statistics.median(ordered)),
+        p90=float(p90),
+    )
+
+
+def flat_indices_to_xy(indices, width: int):
+    import torch
+
+    if width <= 0:
+        raise ValueError('feature-map width must be positive')
+    return torch.stack(
+        (indices.remainder(width),
+         torch.div(indices, width, rounding_mode='floor')),
+        dim=-1,
+    ).float()
+
+
+def select_queries(localized_heatmap, num_proposals: int) -> dict:
+    if localized_heatmap.ndim != 4 or localized_heatmap.shape[0] != 1:
+        raise ValueError('localized_heatmap must have shape [1,C,H,W]')
+    _, _, height, width = localized_heatmap.shape
+    spatial_size = height * width
+    flat = localized_heatmap.flatten(2)
+    top = flat.reshape(1, -1).argsort(
+        dim=-1, descending=True)[..., :num_proposals]
+    labels = top // spatial_size
+    indices = top % spatial_size
+    scores = flat.gather(2,
+                         indices[:, None].expand(-1, flat.shape[1], -1))
+    return dict(
+        labels=labels,
+        indices=indices,
+        xy=flat_indices_to_xy(indices, width),
+        class_scores=scores,
+    )
+
+
+def query_metrics(query_xy, query_labels, gt_xy, gt_labels) -> dict:
+    import torch
+
+    nearest = gt_xy.new_full((len(gt_xy),), float('inf'))
+    no_same_class = torch.ones(
+        len(gt_xy), dtype=torch.bool, device=gt_xy.device)
+    for gt_index, label in enumerate(gt_labels):
+        mask = query_labels == label
+        if mask.any():
+            no_same_class[gt_index] = False
+            nearest[gt_index] = torch.linalg.vector_norm(
+                query_xy[mask] - gt_xy[gt_index], dim=1).min()
+    return dict(
+        nearest_distance=nearest,
+        recall={radius: nearest <= radius for radius in RECALL_RADII},
+        no_same_class=no_same_class,
+    )
+
+
+def absolute_yaw_error(pred_yaw, gt_yaw):
+    import torch
+
+    delta = pred_yaw - gt_yaw
+    return torch.atan2(torch.sin(delta), torch.cos(delta)).abs()
