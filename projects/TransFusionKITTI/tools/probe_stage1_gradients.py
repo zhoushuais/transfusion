@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import json
 import math
 from pathlib import Path
 import statistics
@@ -377,3 +378,161 @@ def probe_model_state(model, optim_wrapper, raw_batch) -> dict:
     )
     validate_state_result(result)
     return result
+
+
+def _safe_ratio(numerator: float, denominator: float):
+    if denominator == 0:
+        return None
+    return float(numerator / denominator)
+
+
+def build_comparison(fresh: dict, checkpoint: dict) -> dict:
+    fresh_probability = fresh[
+        'heatmap']['positive_probability']['overall']['mean']
+    checkpoint_probability = checkpoint[
+        'heatmap']['positive_probability']['overall']['mean']
+    fresh_gradient = fresh['heatmap_only_gradients']['overall_norm']
+    checkpoint_gradient = checkpoint[
+        'heatmap_only_gradients']['overall_norm']
+    return dict(
+        positive_probability_ratio_checkpoint_to_fresh=_safe_ratio(
+            checkpoint_probability, fresh_probability),
+        positive_probability_change_checkpoint_minus_fresh=float(
+            checkpoint_probability - fresh_probability),
+        heatmap_gradient_ratio_checkpoint_to_fresh=_safe_ratio(
+            checkpoint_gradient, fresh_gradient),
+        heatmap_gradient_change_checkpoint_minus_fresh=float(
+            checkpoint_gradient - fresh_gradient),
+        both_have_gradients_and_update=(
+            fresh_gradient > 0
+            and checkpoint_gradient > 0
+            and not fresh['parameter_delta']['all_zero']
+            and not checkpoint['parameter_delta']['all_zero']
+        ),
+        checkpoint_low_positive_response=(
+            checkpoint_probability is not None
+            and checkpoint_probability < 0.05
+        ),
+    )
+
+
+def build_batch_summary(fresh: dict, checkpoint: dict) -> dict:
+    fresh_centers = fresh['heatmap']['positive_centers']
+    checkpoint_centers = checkpoint['heatmap']['positive_centers']
+    if (fresh['gt_counts'] != checkpoint['gt_counts']
+            or fresh_centers != checkpoint_centers):
+        raise RuntimeError('fresh and checkpoint batch targets differ')
+    return dict(
+        gt_counts=fresh['gt_counts'],
+        positive_centers=fresh_centers,
+    )
+
+
+def write_report(result: dict, output: Path) -> None:
+    serialized = json.dumps(result, indent=2, allow_nan=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(serialized, encoding='utf-8')
+
+
+def print_summary(result: dict, output: Path) -> None:
+    for name in ('fresh', 'checkpoint'):
+        state = result[name]
+        print(
+            f'{name}: loss_heatmap={state["losses"]["loss_heatmap"]:.6f} '
+            f'positive_probability='
+            f'{state["heatmap"]["positive_probability"]["overall"]["mean"]:.6f} '
+            f'heatmap_grad='
+            f'{state["heatmap_only_gradients"]["overall_norm"]:.6f} '
+            f'parameter_delta='
+            f'{state["parameter_delta"]["overall_norm"]:.6e}')
+    print('comparison:', result['comparison'])
+    print(f'STAGE1_GRADIENT_PROBE_OK output={output}')
+
+
+def _build_model_and_optimizer(cfg, device, checkpoint_path=None):
+    from mmengine.optim import build_optim_wrapper
+    from mmengine.runner.checkpoint import load_checkpoint
+
+    from mmdet3d.registry import MODELS
+
+    model = MODELS.build(cfg.model)
+    model.init_weights()
+    checkpoint = None
+    if checkpoint_path is not None:
+        checkpoint = load_checkpoint(
+            model,
+            str(checkpoint_path),
+            map_location='cpu',
+            strict=True,
+        )
+    model.to(device)
+    optim_wrapper = build_optim_wrapper(model, cfg.optim_wrapper)
+    if checkpoint is not None:
+        optimizer_state = copy.deepcopy(require_optimizer_state(checkpoint))
+        optim_wrapper.load_state_dict(optimizer_state)
+    return model, optim_wrapper
+
+
+def run(args) -> dict:
+    import torch
+    from mmengine.config import Config
+    from mmengine.registry import init_default_scope
+    from mmengine.runner import Runner, set_random_seed
+    from mmengine.utils import import_modules_from_strings
+
+    validate_paths(args.config, args.checkpoint)
+    cfg = Config.fromfile(str(args.config))
+    if cfg.get('custom_imports'):
+        import_modules_from_strings(**cfg.custom_imports)
+    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
+    validate_probe_config(cfg)
+
+    set_random_seed(args.seed, deterministic=False)
+    dataloader = Runner.build_dataloader(
+        build_probe_dataloader_cfg(cfg),
+        seed=args.seed,
+        diff_rank_seed=False,
+    )
+    raw_batch = next(iter(dataloader))
+    device = torch.device(args.device)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+
+    fresh_model, fresh_optimizer = _build_model_and_optimizer(cfg, device)
+    fresh = probe_model_state(fresh_model, fresh_optimizer, raw_batch)
+    del fresh_model, fresh_optimizer
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    checkpoint_model, checkpoint_optimizer = _build_model_and_optimizer(
+        cfg, device, args.checkpoint)
+    checkpoint = probe_model_state(
+        checkpoint_model, checkpoint_optimizer, raw_batch)
+
+    result = dict(
+        metadata=dict(
+            config=str(args.config.resolve()),
+            checkpoint=str(args.checkpoint.resolve()),
+            device=str(device),
+            seed=args.seed,
+            batch_size=int(cfg.train_dataloader.batch_size),
+            accumulative_counts=int(
+                cfg.optim_wrapper.get('accumulative_counts', 1)),
+            class_names=list(CLASS_NAMES),
+        ),
+        batch=build_batch_summary(fresh, checkpoint),
+        fresh=fresh,
+        checkpoint=checkpoint,
+        comparison=build_comparison(fresh, checkpoint),
+    )
+    write_report(result, args.output)
+    print_summary(result, args.output)
+    return result
+
+
+def main() -> None:
+    run(build_parser().parse_args())
+
+
+if __name__ == '__main__':
+    main()

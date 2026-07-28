@@ -196,3 +196,49 @@ def test_validate_state_result_rejects_invalid_numeric_or_grad_state(
     invalid[path[0]][path[1]] = value
     with pytest.raises(RuntimeError, match=message):
         probe.validate_state_result(invalid)
+
+
+def _state(positive, gradient, delta):
+    return dict(
+        heatmap=dict(positive_probability=dict(overall=dict(mean=positive))),
+        heatmap_only_gradients=dict(overall_norm=gradient),
+        parameter_delta=dict(all_zero=not delta),
+    )
+
+
+def test_build_comparison_reports_both_update_paths():
+    result = probe.build_comparison(
+        _state(0.5, 4.0, True),
+        _state(0.03, 1.0, True),
+    )
+    assert result['both_have_gradients_and_update'] is True
+    assert result[
+        'positive_probability_ratio_checkpoint_to_fresh'] == pytest.approx(
+            0.06)
+    assert result[
+        'heatmap_gradient_ratio_checkpoint_to_fresh'] == pytest.approx(0.25)
+
+
+def test_write_report_rejects_nan(tmp_path: Path):
+    output = tmp_path / 'probe.json'
+    with pytest.raises(ValueError):
+        probe.write_report({'value': float('nan')}, output)
+    assert not output.exists()
+
+
+def test_build_batch_summary_requires_matching_targets():
+    fresh = dict(
+        gt_counts={'Pedestrian': 1, 'Cyclist': 2, 'Car': 3},
+        heatmap=dict(positive_centers=dict(
+            overall=6,
+            by_class={'Pedestrian': 1, 'Cyclist': 2, 'Car': 3},
+        )),
+    )
+    checkpoint = copy.deepcopy(fresh)
+    assert probe.build_batch_summary(fresh, checkpoint) == {
+        'gt_counts': fresh['gt_counts'],
+        'positive_centers': fresh['heatmap']['positive_centers'],
+    }
+    checkpoint['heatmap']['positive_centers']['overall'] = 5
+    with pytest.raises(RuntimeError, match='batch targets differ'):
+        probe.build_batch_summary(fresh, checkpoint)
