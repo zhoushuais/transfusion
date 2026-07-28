@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument(
+        '--override-heatmap-bias',
+        type=float,
+        default=None,
+        help=(
+            'diagnostic-only bias for the fresh model heatmap output layer; '
+            'the checkpoint model is left unchanged'),
+    )
     parser.add_argument('--output', type=Path, required=True)
     return parser
 
@@ -215,6 +223,21 @@ def output_channel_norms(weight, bias) -> dict:
         )
         for index, name in enumerate(CLASS_NAMES)
     }
+
+
+def override_heatmap_bias(model, value: float) -> None:
+    """Override only the fresh model dense heatmap output bias for a probe."""
+    import torch
+
+    if not math.isfinite(float(value)):
+        raise ValueError('--override-heatmap-bias must be finite')
+    final_layer = model.bbox_head.heatmap_head[-1]
+    if not hasattr(final_layer, 'bias') or final_layer.bias is None:
+        raise ValueError('final heatmap layer must have a bias parameter')
+    if final_layer.bias.numel() != len(CLASS_NAMES):
+        raise ValueError('final heatmap layer must have three output biases')
+    with torch.no_grad():
+        final_layer.bias.fill_(float(value))
 
 
 def summarize_gt_counts(gt_instances) -> dict:
@@ -482,7 +505,10 @@ def print_summary(result: dict, output: Path) -> None:
     print(f'STAGE1_GRADIENT_PROBE_OK output={output}')
 
 
-def _build_model_and_optimizer(cfg, device, checkpoint_path=None):
+def _build_model_and_optimizer(cfg,
+                               device,
+                               checkpoint_path=None,
+                               heatmap_bias=None):
     from mmengine.optim import build_optim_wrapper
     from mmengine.runner.checkpoint import load_checkpoint
 
@@ -498,6 +524,8 @@ def _build_model_and_optimizer(cfg, device, checkpoint_path=None):
             map_location='cpu',
             strict=True,
         )
+    if heatmap_bias is not None:
+        override_heatmap_bias(model, heatmap_bias)
     model.to(device)
     optim_wrapper = build_optim_wrapper(model, cfg.optim_wrapper)
     if checkpoint is not None:
@@ -531,7 +559,11 @@ def run(args) -> dict:
     if device.type == 'cuda':
         torch.cuda.set_device(device)
 
-    fresh_model, fresh_optimizer = _build_model_and_optimizer(cfg, device)
+    fresh_model, fresh_optimizer = _build_model_and_optimizer(
+        cfg,
+        device,
+        heatmap_bias=args.override_heatmap_bias,
+    )
     fresh = probe_model_state(fresh_model, fresh_optimizer, raw_batch)
     del fresh_model, fresh_optimizer
     if device.type == 'cuda':
@@ -551,6 +583,7 @@ def run(args) -> dict:
             batch_size=int(cfg.train_dataloader.batch_size),
             accumulative_counts=int(
                 cfg.optim_wrapper.get('accumulative_counts', 1)),
+            override_heatmap_bias=args.override_heatmap_bias,
             class_names=list(CLASS_NAMES),
         ),
         batch=build_batch_summary(fresh, checkpoint),

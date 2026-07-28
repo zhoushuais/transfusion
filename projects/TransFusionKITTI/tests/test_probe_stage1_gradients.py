@@ -25,6 +25,7 @@ def test_parser_requires_checkpoint_and_output():
     ])
     assert args.device == 'cuda:0'
     assert args.seed == 0
+    assert args.override_heatmap_bias is None
 
 
 def test_script_help_runs_from_repository_root():
@@ -238,6 +239,27 @@ def test_output_channel_gradient_summary_uses_three_kitti_classes():
     result = probe.output_channel_norms(weight, bias)
     assert set(result) == {'Pedestrian', 'Cyclist', 'Car'}
     assert result['Car']['bias_norm'] == pytest.approx(3.0)
+
+
+@requires_torch
+def test_override_heatmap_bias_changes_only_three_output_biases():
+    final_layer = torch.nn.Conv2d(4, 3, kernel_size=1)
+    model = SimpleNamespace(
+        bbox_head=SimpleNamespace(
+            heatmap_head=torch.nn.Sequential(final_layer)))
+    probe.override_heatmap_bias(model, -2.19)
+    torch.testing.assert_close(
+        final_layer.bias.detach(), torch.full((3,), -2.19))
+
+
+@requires_torch
+def test_override_heatmap_bias_rejects_nonfinite_value():
+    final_layer = torch.nn.Conv2d(4, 3, kernel_size=1)
+    model = SimpleNamespace(
+        bbox_head=SimpleNamespace(
+            heatmap_head=torch.nn.Sequential(final_layer)))
+    with pytest.raises(ValueError, match='finite'):
+        probe.override_heatmap_bias(model, float('nan'))
 
 
 @requires_torch

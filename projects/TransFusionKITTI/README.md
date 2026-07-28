@@ -929,3 +929,20 @@ CUDA_VISIBLE_DEVICES=2 python \
 不表示 Stage 1 已修复。检查 JSON 前不要启动 Stage 2，也不要重跑 40 epoch
 Stage 1；下一步修复方案必须依据 fresh/checkpoint 的正中心概率、heatmap-only
 梯度、optimizer 归属和参数变化量共同确定。
+
+若要验证 dense heatmap 输出 bias 是否是训练初期塌缩的诱因，可额外对 fresh
+模型设置一个诊断 bias。该选项只影响随机初始化的 fresh 模型，checkpoint 模型
+仍按原值加载，不会修改训练代码或保存权重：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python \
+  projects/TransFusionKITTI/tools/probe_stage1_gradients.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --checkpoint work_dirs/transfusion_l_kitti_formal_run1_xyfix/epoch_5.pth \
+  --override-heatmap-bias -2.19 \
+  --output work_dirs/transfusion_l_kitti_formal_run1_xyfix/stage1_gradient_probe_bias219.json
+```
+
+该命令的结果只能与不带该选项的原始 probe 对照解释：若 fresh 的初始
+`loss_heatmap`、GT-center probability 和 heatmap-only gradient 同时显著改善，
+`-2.19` 才能作为下一步短程 overfit 试验的候选初始化；这还不是正式修复结论。
