@@ -36,9 +36,15 @@ def validate_stage1_config(cfg) -> None:
         raise ValueError(
             'Stage 1 diagnostics require model.fuse_img=False')
     bbox_head = cfg.model.get('bbox_head')
-    if bbox_head is not None and int(bbox_head.get('num_classes', -1)) != len(
+    if tuple(cfg.get('class_names', ())) != CLASS_NAMES:
+        raise ValueError(
+            'Stage 1 diagnostics require KITTI class order: '
+            'Pedestrian, Cyclist, Car')
+    if bbox_head is None or int(bbox_head.get('num_classes', -1)) != len(
             CLASS_NAMES):
         raise ValueError('Stage 1 diagnostics require exactly 3 KITTI classes')
+    if int(bbox_head.get('num_decoder_layers', -1)) != 1:
+        raise ValueError('Stage 1 diagnostics require one decoder layer')
 
 
 def build_diagnostic_dataloader_cfg(cfg):
@@ -131,7 +137,7 @@ def select_queries(localized_heatmap, num_proposals: int) -> dict:
     return dict(
         labels=labels,
         indices=indices,
-        xy=flat_indices_to_xy(indices, width),
+        xy=flat_indices_to_xy(indices, width) + 0.5,
         class_scores=scores,
     )
 

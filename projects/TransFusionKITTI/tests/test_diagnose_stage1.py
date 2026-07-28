@@ -40,6 +40,25 @@ def test_validate_stage1_rejects_fusion_config():
         diagnose_stage1.validate_stage1_config(cfg)
 
 
+def test_validate_stage1_locks_class_order_and_single_decoder():
+    cfg = ConfigDict(
+        class_names=('Pedestrian', 'Cyclist', 'Car'),
+        model=ConfigDict(
+            fuse_img=False,
+            bbox_head=ConfigDict(num_classes=3, num_decoder_layers=1),
+        ),
+    )
+    diagnose_stage1.validate_stage1_config(cfg)
+
+    cfg.class_names = ('Car', 'Pedestrian', 'Cyclist')
+    with pytest.raises(ValueError, match='class order'):
+        diagnose_stage1.validate_stage1_config(cfg)
+    cfg.class_names = diagnose_stage1.CLASS_NAMES
+    cfg.model.bbox_head.num_decoder_layers = 2
+    with pytest.raises(ValueError, match='decoder layer'):
+        diagnose_stage1.validate_stage1_config(cfg)
+
+
 def test_build_diagnostic_dataloader_cfg_is_ordered_and_unaugmented():
     cfg = ConfigDict(
         backend_args=None,
@@ -248,7 +267,7 @@ def test_select_queries_preserves_class_and_xy():
 
     assert selected['labels'][0].tolist() == [0, 1]
     torch.testing.assert_close(
-        selected['xy'][0], torch.tensor([[4., 1.], [1., 2.]]))
+        selected['xy'][0], torch.tensor([[4.5, 1.5], [1.5, 2.5]]))
 
 
 @requires_torch
