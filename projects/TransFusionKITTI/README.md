@@ -905,3 +905,25 @@ Stage 0 继承的 Faster R-CNN `OptimWrapper` 没有 `clip_grad`，日志通常�
 允许评估的唯一 micro-batch/accumulation 备选是 Stage 0 `2/8`、Stage 1
 `3/16`、Stage 2 `1/16`；任何改变都必须记录实际配置和 commit，并在同组正式
 实验的所有 seed 中保持一致，不能只对某一次运行临时改值。
+
+### Stage 1 gradient probe
+
+仅当 `stage1_diagnostics.json` 已显示 dense GT-center score 异常偏低时运行
+本探针。它使用 Stage 1 正式训练 pipeline 和同一个训练 raw batch，对比随机
+初始化模型与指定 Stage 1 checkpoint。两种状态都会在内存中执行一次 FP32
+诊断 optimizer step，但不会保存或覆盖任何模型 checkpoint。
+
+checkpoint 必须包含正式训练保存的 AdamW optimizer state。当前 run1 使用：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python \
+  projects/TransFusionKITTI/tools/probe_stage1_gradients.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --checkpoint "work_dirs/transfusion_l_kitti_formal_run1_xyfix/best_Kitti metric_pred_instances_3d_KITTI_Overall_3D_AP40_moderate_epoch_5.pth" \
+  --output work_dirs/transfusion_l_kitti_formal_run1_xyfix/stage1_gradient_probe.json
+```
+
+终端出现 `STAGE1_GRADIENT_PROBE_OK` 只表示探针完整执行且 JSON 已写出，
+不表示 Stage 1 已修复。检查 JSON 前不要启动 Stage 2，也不要重跑 40 epoch
+Stage 1；下一步修复方案必须依据 fresh/checkpoint 的正中心概率、heatmap-only
+梯度、optimizer 归属和参数变化量共同确定。
