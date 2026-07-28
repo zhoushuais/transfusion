@@ -881,7 +881,7 @@ saves a model checkpoint.
 CUDA_VISIBLE_DEVICES=2 python \
   projects/TransFusionKITTI/tools/probe_stage1_gradients.py \
   projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --checkpoint "work_dirs/transfusion_l_kitti_formal_run1_xyfix/best_Kitti metric_pred_instances_3d_KITTI_Overall_3D_AP40_moderate_epoch_5.pth" \
+  --checkpoint work_dirs/transfusion_l_kitti_formal_run1_xyfix/epoch_5.pth \
   --output work_dirs/transfusion_l_kitti_formal_run1_xyfix/stage1_gradient_probe.json
 ```
 

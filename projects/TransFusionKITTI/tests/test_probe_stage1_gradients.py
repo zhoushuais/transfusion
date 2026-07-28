@@ -42,6 +42,18 @@ def test_script_help_runs_from_repository_root():
     assert '--checkpoint' in result.stdout
 
 
+def test_readme_gradient_probe_uses_resumable_epoch_checkpoint():
+    repository_root = Path(__file__).resolve().parents[3]
+    readme = (repository_root / 'projects/TransFusionKITTI/README.md').read_text(
+        encoding='utf-8')
+    gradient_probe_section = readme.split(
+        '### Stage 1 gradient probe', maxsplit=1)[1]
+    assert ('--checkpoint '
+            'work_dirs/transfusion_l_kitti_formal_run1_xyfix/epoch_5.pth'
+            in gradient_probe_section)
+    assert 'best_Kitti metric_pred_instances_3d' not in gradient_probe_section
+
+
 def test_ensure_repository_root_on_path_prepends_root():
     search_path = ['existing']
     root = probe.ensure_repository_root_on_path(search_path)

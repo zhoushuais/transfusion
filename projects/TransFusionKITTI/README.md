@@ -913,13 +913,15 @@ Stage 0 继承的 Faster R-CNN `OptimWrapper` 没有 `clip_grad`，日志通常�
 初始化模型与指定 Stage 1 checkpoint。两种状态都会在内存中执行一次 FP32
 诊断 optimizer step，但不会保存或覆盖任何模型 checkpoint。
 
-checkpoint 必须包含正式训练保存的 AdamW optimizer state。当前 run1 使用：
+checkpoint 必须包含正式训练保存的 AdamW optimizer state。MMEngine 的
+`best_*.pth` 只保存模型权重，不满足本探针要求；当前 run1 应使用同一轮的
+普通训练 checkpoint：
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python \
   projects/TransFusionKITTI/tools/probe_stage1_gradients.py \
   projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
-  --checkpoint "work_dirs/transfusion_l_kitti_formal_run1_xyfix/best_Kitti metric_pred_instances_3d_KITTI_Overall_3D_AP40_moderate_epoch_5.pth" \
+  --checkpoint work_dirs/transfusion_l_kitti_formal_run1_xyfix/epoch_5.pth \
   --output work_dirs/transfusion_l_kitti_formal_run1_xyfix/stage1_gradient_probe.json
 ```
 
