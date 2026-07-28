@@ -159,3 +159,60 @@ def absolute_yaw_error(pred_yaw, gt_yaw):
 
     delta = pred_yaw - gt_yaw
     return torch.atan2(torch.sin(delta), torch.cos(delta)).abs()
+
+
+def strict_iou_threshold(class_label: int) -> float:
+    if class_label < 0 or class_label >= len(CLASS_NAMES):
+        raise ValueError(f'invalid KITTI class label: {class_label}')
+    return STRICT_IOU[CLASS_NAMES[class_label]]
+
+
+def aligned_bev_iou(pred_boxes, gt_boxes):
+    from mmcv.ops import box_iou_rotated
+
+    if len(pred_boxes) == 0:
+        return pred_boxes.new_zeros((0,))
+    pred_bev = pred_boxes[:, [0, 1, 3, 4, 6]]
+    gt_bev = gt_boxes[:, [0, 1, 3, 4, 6]]
+    return box_iou_rotated(pred_bev, gt_bev, aligned=True)
+
+
+def build_match_record(
+    pred_boxes,
+    gt_boxes,
+    gt_labels,
+    query_labels,
+    decoder_logits,
+    query_heatmap_score,
+    assignment,
+    bev_iou_fn=aligned_bev_iou,
+) -> dict:
+    query_indices = (assignment.gt_inds > 0).nonzero(as_tuple=False).flatten()
+    gt_indices = assignment.gt_inds[query_indices] - 1
+    matched_pred = pred_boxes[query_indices]
+    matched_gt = gt_boxes[gt_indices]
+    matched_labels = gt_labels[gt_indices]
+    label_match = query_labels[query_indices] == matched_labels
+    decoder_score = decoder_logits[0, matched_labels,
+                                   query_indices].sigmoid()
+    query_score = query_heatmap_score[0, matched_labels, query_indices]
+    final_score = decoder_score * query_score * label_match.float()
+    thresholds = matched_pred.new_tensor([
+        strict_iou_threshold(int(label.item())) for label in matched_labels
+    ])
+    iou_3d = assignment.max_overlaps[query_indices]
+    return dict(
+        gt_labels=matched_labels,
+        query_indices=query_indices,
+        gt_indices=gt_indices,
+        center_abs_error=(matched_pred[:, :3] - matched_gt[:, :3]).abs(),
+        dim_abs_error=(matched_pred[:, 3:6] - matched_gt[:, 3:6]).abs(),
+        yaw_abs_error=absolute_yaw_error(matched_pred[:, 6],
+                                         matched_gt[:, 6]),
+        bev_iou=bev_iou_fn(matched_pred, matched_gt),
+        iou_3d=iou_3d,
+        strict_iou_pass=iou_3d >= thresholds,
+        query_label_match=label_match,
+        decoder_gt_score=decoder_score,
+        final_gt_score=final_score,
+    )

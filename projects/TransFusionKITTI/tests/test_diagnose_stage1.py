@@ -1,5 +1,6 @@
 from pathlib import Path
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +100,14 @@ def test_numeric_summary_rejects_non_finite_values():
         diagnose_stage1.numeric_summary([1.0, float('inf')])
 
 
+def test_strict_iou_threshold_uses_kitti_class_contract():
+    assert diagnose_stage1.strict_iou_threshold(0) == pytest.approx(0.5)
+    assert diagnose_stage1.strict_iou_threshold(1) == pytest.approx(0.5)
+    assert diagnose_stage1.strict_iou_threshold(2) == pytest.approx(0.7)
+    with pytest.raises(ValueError, match='class label'):
+        diagnose_stage1.strict_iou_threshold(3)
+
+
 @requires_torch
 def test_flat_indices_restore_xy_on_non_square_map():
     indices = torch.tensor([0, 4, 5, 13])
@@ -149,3 +158,44 @@ def test_wrap_angle_returns_small_absolute_boundary_error():
 
     torch.testing.assert_close(
         error, torch.tensor([0.2]), atol=1e-6, rtol=1e-6)
+
+
+@requires_torch
+def test_build_match_record_uses_assigned_query_gt_pairs():
+    pred_boxes = torch.tensor([
+        [10., 1., -1., 4., 2., 1.5, 0.2],
+        [20., 2., -1., 1., 1., 1.7, -0.2],
+    ])
+    gt_boxes = torch.tensor([
+        [10.5, 1.5, -1.2, 3.5, 1.5, 1.4, 0.1],
+        [20.5, 2.5, -0.8, 1.2, 0.8, 1.6, -0.1],
+    ])
+    gt_labels = torch.tensor([2, 0])
+    query_labels = torch.tensor([2, 1])
+    logits = torch.tensor([[[-8., 2.], [-8., 3.], [4., -8.]]])
+    query_scores = torch.full((1, 3, 2), 0.5)
+    assignment = SimpleNamespace(
+        gt_inds=torch.tensor([1, 2]),
+        max_overlaps=torch.tensor([0.8, 0.4]),
+    )
+
+    record = diagnose_stage1.build_match_record(
+        pred_boxes=pred_boxes,
+        gt_boxes=gt_boxes,
+        gt_labels=gt_labels,
+        query_labels=query_labels,
+        decoder_logits=logits,
+        query_heatmap_score=query_scores,
+        assignment=assignment,
+        bev_iou_fn=lambda pred, gt: torch.tensor([0.7, 0.3]),
+    )
+
+    assert record['gt_labels'].tolist() == [2, 0]
+    torch.testing.assert_close(record['center_abs_error'][0],
+                               torch.tensor([0.5, 0.5, 0.2]))
+    torch.testing.assert_close(record['dim_abs_error'][1],
+                               torch.tensor([0.2, 0.2, 0.1]))
+    torch.testing.assert_close(record['iou_3d'], torch.tensor([0.8, 0.4]))
+    assert record['query_label_match'].tolist() == [True, False]
+    assert record['strict_iou_pass'].tolist() == [True, False]
+    assert record['final_gt_score'][1].item() == 0.0
