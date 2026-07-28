@@ -19,6 +19,7 @@ def test_lidar_config_contract():
     assert cfg.model.type == 'TransFusionKITTIDetector'
     assert cfg.model.fuse_img is False
     assert cfg.model.bbox_head.num_classes == 3
+    assert cfg.model.bbox_head.dense_heatmap_init_bias is None
     assert 'vel' not in cfg.model.bbox_head.common_heads
     assert cfg.model.bbox_head.bbox_coder.code_size == 8
     assert tuple(cfg.train_dataloader.dataset.dataset.metainfo['classes']) == (
@@ -72,6 +73,7 @@ def test_lc_config_uses_single_camera_without_geometry_augmentation():
     assert cfg.model.fuse_img is True
     assert cfg.model.bbox_head.fuse_img is True
     assert cfg.model.bbox_head.num_views == 1
+    assert cfg.model.bbox_head.dense_heatmap_init_bias is None
     pipeline_types = [item['type'] for item in cfg.train_pipeline]
     assert 'LoadImageFromFileMono3D' in pipeline_types
     assert 'ObjectSample' not in pipeline_types

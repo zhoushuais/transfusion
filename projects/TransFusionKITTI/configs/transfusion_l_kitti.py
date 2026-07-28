@@ -60,6 +60,7 @@ model = dict(
         hidden_channel=128,
         num_classes=3,
         nms_kernel_size=3,
+        dense_heatmap_init_bias=None,
         bn_momentum=0.1,
         num_decoder_layers=1,
         decoder_layer=dict(

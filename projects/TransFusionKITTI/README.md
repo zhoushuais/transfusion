@@ -946,3 +946,43 @@ CUDA_VISIBLE_DEVICES=2 python \
 该命令的结果只能与不带该选项的原始 probe 对照解释：若 fresh 的初始
 `loss_heatmap`、GT-center probability 和 heatmap-only gradient 同时显著改善，
 `-2.19` 才能作为下一步短程 overfit 试验的候选初始化；这还不是正式修复结论。
+
+### Stage 1 dense heatmap bias smoke
+
+只有当 `stage1_gradient_probe_bias219.json` 显示 `-2.19` 能明显缓解 fresh
+初始状态后，才运行本 smoke。该实验只验证训练侧初始化是否能阻止 Stage 1
+dense heatmap 快速塌缩，不作为正式结果，也不要使用 `--resume` 覆盖旧目录。
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python tools/train.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --work-dir work_dirs/transfusion_l_kitti_stage1_bias219_smoke \
+  --cfg-options \
+    model.bbox_head.dense_heatmap_init_bias=-2.19 \
+    train_cfg.max_epochs=2 \
+    train_dataloader.dataset.dataset.indices=64
+```
+
+训练结束后，对该 smoke checkpoint 再跑一次 probe。这里继续传
+`--override-heatmap-bias -2.19`，只是为了让 fresh 对照模型和 smoke 训练初始
+条件一致；checkpoint 本身仍按 `epoch_2.pth` 加载：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python \
+  projects/TransFusionKITTI/tools/probe_stage1_gradients.py \
+  projects/TransFusionKITTI/configs/transfusion_l_kitti.py \
+  --checkpoint work_dirs/transfusion_l_kitti_stage1_bias219_smoke/epoch_2.pth \
+  --override-heatmap-bias -2.19 \
+  --output work_dirs/transfusion_l_kitti_stage1_bias219_smoke/stage1_gradient_probe_after_bias_smoke.json
+```
+
+跑完后检查并保留：
+
+```bash
+ls -lh work_dirs/transfusion_l_kitti_stage1_bias219_smoke/epoch_2.pth \
+  work_dirs/transfusion_l_kitti_stage1_bias219_smoke/stage1_gradient_probe_after_bias_smoke.json
+```
+
+把 smoke 训练日志和
+`stage1_gradient_probe_after_bias_smoke.json` 发回后，再判断是否进入短程
+overfit 或停止 TransFusion 路线。

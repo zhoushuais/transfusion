@@ -1,5 +1,6 @@
 # Adapted from MMDetection3D's maintained TransFusion LiDAR head.
 import copy
+import math
 from typing import List, Tuple
 
 import numpy as np
@@ -49,6 +50,7 @@ class TransFusionKITTIHead(nn.Module):
         # config for FFN
         common_heads=dict(),
         num_heatmap_convs=2,
+        dense_heatmap_init_bias=None,
         conv_cfg=dict(type='Conv1d'),
         norm_cfg=dict(type='BN1d'),
         bias='auto',
@@ -74,6 +76,7 @@ class TransFusionKITTIHead(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.bn_momentum = bn_momentum
         self.nms_kernel_size = nms_kernel_size
+        self.dense_heatmap_init_bias = dense_heatmap_init_bias
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.common_heads = copy.deepcopy(common_heads)
@@ -206,6 +209,26 @@ class TransFusionKITTIHead(nn.Module):
         if hasattr(self, 'query'):
             nn.init.xavier_normal_(self.query)
         self.init_bn_momentum()
+        self.init_dense_heatmap_bias()
+
+    def init_dense_heatmap_bias(self):
+        if self.dense_heatmap_init_bias is None:
+            return
+        value = float(self.dense_heatmap_init_bias)
+        if not math.isfinite(value):
+            raise ValueError('dense_heatmap_init_bias must be finite')
+        self._fill_dense_heatmap_bias(self.heatmap_head, value)
+        if self.fuse_img:
+            self._fill_dense_heatmap_bias(self.image_heatmap_head, value)
+
+    def _fill_dense_heatmap_bias(self, heatmap_head, value):
+        final_layer = heatmap_head[-1]
+        if not hasattr(final_layer, 'bias') or final_layer.bias is None:
+            raise ValueError('dense heatmap output layer must have bias')
+        if final_layer.bias.numel() != self.num_classes:
+            raise ValueError(
+                'dense heatmap output bias must match num_classes')
+        nn.init.constant_(final_layer.bias, value)
 
     def init_bn_momentum(self):
         for m in self.modules():

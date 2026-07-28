@@ -14,7 +14,7 @@ from projects.TransFusionKITTI.transfusion_kitti.models import \
     TransFusionKITTIHead
 
 
-def make_head(fuse_img=False, train_cfg=None):
+def make_head(fuse_img=False, train_cfg=None, dense_heatmap_init_bias=None):
     init_default_scope('mmdet3d')
     return TransFusionKITTIHead(
         fuse_img=fuse_img,
@@ -39,6 +39,7 @@ def make_head(fuse_img=False, train_cfg=None):
             norm_cfg=dict(type='LN'),
             pos_encoding_cfg=dict(input_channel=2, num_pos_feats=64),
         ),
+        dense_heatmap_init_bias=dense_heatmap_init_bias,
         train_cfg=train_cfg,
         test_cfg=ConfigDict(
             dataset='KITTI',
@@ -116,6 +117,17 @@ def test_lidar_head_forward_has_no_velocity_and_returns_batch_query_state():
     assert pred['center'].shape == (2, 2, 20)
     assert pred['query_labels'].shape == (2, 20)
     assert not hasattr(head, 'query_labels')
+
+
+def test_dense_heatmap_init_bias_sets_lidar_dense_heatmap_output_bias():
+    head = make_head(fuse_img=False, dense_heatmap_init_bias=-2.19)
+
+    final_layer = head.heatmap_head[-1]
+
+    torch.testing.assert_close(
+        final_layer.bias.detach(),
+        torch.full_like(final_layer.bias.detach(), -2.19),
+    )
 
 
 def test_non_square_position_grid_matches_feature_flatten_order():
