@@ -197,3 +197,183 @@ def summarize_gt_counts(gt_instances) -> dict:
                 raise ValueError(f'invalid KITTI class label: {label}')
             counts[CLASS_NAMES[label]] += 1
     return counts
+
+
+def require_optimizer_state(checkpoint: dict) -> dict:
+    optimizer_state = checkpoint.get('optimizer')
+    if not isinstance(optimizer_state, dict):
+        raise RuntimeError('checkpoint does not contain optimizer state')
+    return optimizer_state
+
+
+def validate_state_result(result: dict) -> None:
+    if not all(math.isfinite(value) for value in result['losses'].values()):
+        raise RuntimeError('loss contains NaN or Inf')
+    if not all(result['requires_grad'].values()):
+        raise RuntimeError(
+            'heatmap head parameter does not require gradients')
+    if not all(result['optimizer_membership'].values()):
+        raise RuntimeError('heatmap head parameter is missing from optimizer')
+    if result['heatmap']['positive_centers']['overall'] <= 0:
+        raise RuntimeError('training batch contains no heatmap positive center')
+    if result['heatmap']['nonfinite_target_count']:
+        raise RuntimeError('heatmap target contains NaN or Inf')
+    if result['heatmap']['nonfinite_logit_count']:
+        raise RuntimeError('heatmap logits contain NaN or Inf')
+    for key in ('heatmap_only_gradients', 'total_gradients'):
+        if result[key]['nonfinite_count']:
+            raise RuntimeError(f'{key} contains NaN or Inf')
+    if result['parameter_delta']['nonfinite_count']:
+        raise RuntimeError('parameter delta contains NaN or Inf')
+    if result['parameter_delta']['all_zero']:
+        raise RuntimeError('optimizer step did not update heatmap head')
+
+
+def _forward_losses(model, raw_batch):
+    batch = model.data_preprocessor(copy.deepcopy(raw_batch), training=True)
+    inputs = batch['inputs']
+    data_samples = batch['data_samples']
+    features = model.extract_feat(inputs)
+    metas = [sample.metainfo for sample in data_samples]
+    predictions = model.bbox_head(features, metas)
+    gt_instances = [sample.gt_instances_3d for sample in data_samples]
+    targets = model.bbox_head.get_targets(gt_instances, predictions[0])
+    losses = model.bbox_head.loss_by_feat(predictions, gt_instances)
+    dense_logits = predictions[0][0]['dense_heatmap']
+    return (
+        losses,
+        dense_logits,
+        targets[-1],
+        summarize_gt_counts(gt_instances),
+    )
+
+
+def _heatmap_parameters(model) -> dict:
+    parameters = dict(model.bbox_head.heatmap_head.named_parameters())
+    if not parameters:
+        raise RuntimeError('heatmap head has no parameters')
+    return parameters
+
+
+def _current_gradients(named_parameters: Mapping) -> dict:
+    return {
+        name: parameter.grad
+        for name, parameter in named_parameters.items()
+    }
+
+
+def _loss_values(losses: dict) -> dict:
+    values = {}
+    for name, value in losses.items():
+        tensors = value if isinstance(value, (list, tuple)) else [value]
+        values[name] = float(sum(
+            item.detach().float().mean() for item in tensors))
+    return values
+
+
+def _named_final_layer_gradients(named_parameters, gradients, final_layer):
+    by_parameter_id = {
+        id(parameter): gradient
+        for parameter, gradient in zip(named_parameters.values(), gradients)
+    }
+    weight_gradient = by_parameter_id.get(id(final_layer.weight))
+    bias_gradient = by_parameter_id.get(id(final_layer.bias))
+    if weight_gradient is None or bias_gradient is None:
+        raise RuntimeError('final heatmap layer has no gradient')
+    return weight_gradient, bias_gradient
+
+
+def probe_model_state(model, optim_wrapper, raw_batch) -> dict:
+    import torch
+
+    model.train()
+    optim_wrapper.zero_grad()
+    losses, dense_logits, target, gt_counts = _forward_losses(
+        model, raw_batch)
+    total_loss, _ = model.parse_losses(losses)
+    loss_values = dict(total=float(total_loss.detach()),
+                       **_loss_values(losses))
+    heatmap = summarize_heatmap(dense_logits, target)
+    named_parameters = _heatmap_parameters(model)
+    requires_grad = {
+        name: parameter.requires_grad
+        for name, parameter in named_parameters.items()
+    }
+    optimizer_membership = parameter_membership(
+        named_parameters, optim_wrapper.optimizer)
+    preflight = dict(
+        losses=loss_values,
+        requires_grad=requires_grad,
+        optimizer_membership=optimizer_membership,
+        heatmap=heatmap,
+        heatmap_only_gradients=dict(nonfinite_count=0),
+        total_gradients=dict(nonfinite_count=0),
+        parameter_delta=dict(nonfinite_count=0, all_zero=False),
+    )
+    validate_state_result(preflight)
+
+    parameters = tuple(named_parameters.values())
+    isolated = torch.autograd.grad(
+        losses['loss_heatmap'],
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    isolated_by_name = dict(zip(named_parameters, isolated))
+    heatmap_only = summarize_gradients(isolated_by_name)
+
+    scaled_total_loss = optim_wrapper.scale_loss(total_loss)
+    optim_wrapper.backward(scaled_total_loss)
+    total_gradients = summarize_gradients(
+        _current_gradients(named_parameters))
+    all_optimizer_gradients = {
+        f'group_{group_index}.{parameter_index}': parameter.grad
+        for group_index, group in enumerate(
+            optim_wrapper.optimizer.param_groups)
+        for parameter_index, parameter in enumerate(group['params'])
+        if parameter.requires_grad
+    }
+    preclip = summarize_gradients(all_optimizer_gradients)
+
+    final_layer = model.bbox_head.heatmap_head[-1]
+    isolated_weight, isolated_bias = _named_final_layer_gradients(
+        named_parameters, isolated, final_layer)
+    total_weight, total_bias = _named_final_layer_gradients(
+        named_parameters,
+        tuple(parameter.grad for parameter in named_parameters.values()),
+        final_layer,
+    )
+    final_bias = [
+        float(value) for value in final_layer.bias.detach().float().cpu()
+    ]
+    output_channel_heatmap_only = output_channel_norms(
+        isolated_weight, isolated_bias)
+    output_channel_total = output_channel_norms(total_weight, total_bias)
+
+    before = snapshot_parameters(named_parameters)
+    learning_rates = [
+        float(group['lr'])
+        for group in optim_wrapper.optimizer.param_groups
+    ]
+    optim_wrapper.step()
+    delta = summarize_parameter_delta(before, named_parameters)
+    optim_wrapper.zero_grad()
+
+    result = dict(
+        gt_counts=gt_counts,
+        losses=loss_values,
+        heatmap=heatmap,
+        final_bias=final_bias,
+        requires_grad=requires_grad,
+        optimizer_membership=optimizer_membership,
+        heatmap_only_gradients=heatmap_only,
+        total_gradients=total_gradients,
+        output_channel_heatmap_only_gradients=(
+            output_channel_heatmap_only),
+        output_channel_total_gradients=output_channel_total,
+        optimizer_preclip_gradients=preclip,
+        learning_rates=learning_rates,
+        parameter_delta=delta,
+    )
+    validate_state_result(result)
+    return result

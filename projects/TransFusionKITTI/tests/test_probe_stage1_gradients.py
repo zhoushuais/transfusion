@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -145,3 +146,53 @@ def test_summarize_gt_counts_uses_kitti_class_order():
     assert probe.summarize_gt_counts(instances) == {
         'Pedestrian': 1, 'Cyclist': 1, 'Car': 3
     }
+
+
+def test_require_optimizer_state_rejects_missing_state():
+    with pytest.raises(RuntimeError, match='optimizer state'):
+        probe.require_optimizer_state({'state_dict': {}})
+    state = {'state': {}, 'param_groups': []}
+    assert probe.require_optimizer_state({'optimizer': state}) is state
+
+
+def _valid_state_result():
+    return dict(
+        losses=dict(total=1.0, loss_heatmap=0.5),
+        requires_grad={'weight': True},
+        optimizer_membership={'weight': True},
+        heatmap_only_gradients=dict(nonfinite_count=0, overall_norm=1.0),
+        total_gradients=dict(nonfinite_count=0, overall_norm=1.0),
+        parameter_delta=dict(
+            all_zero=False, overall_norm=0.1, nonfinite_count=0),
+        heatmap=dict(
+            nonfinite_target_count=0,
+            nonfinite_logit_count=0,
+            positive_centers=dict(overall=1),
+        ),
+    )
+
+
+def test_validate_state_result_rejects_zero_delta():
+    valid = _valid_state_result()
+    probe.validate_state_result(valid)
+    invalid = copy.deepcopy(valid)
+    invalid['parameter_delta']['all_zero'] = True
+    with pytest.raises(RuntimeError, match='did not update'):
+        probe.validate_state_result(invalid)
+
+
+@pytest.mark.parametrize(
+    ('path', 'value', 'message'),
+    [
+        (('requires_grad', 'weight'), False, 'does not require gradients'),
+        (('losses', 'total'), float('nan'), 'loss contains'),
+        (('parameter_delta', 'nonfinite_count'), 1,
+         'parameter delta contains'),
+    ],
+)
+def test_validate_state_result_rejects_invalid_numeric_or_grad_state(
+        path, value, message):
+    invalid = _valid_state_result()
+    invalid[path[0]][path[1]] = value
+    with pytest.raises(RuntimeError, match=message):
+        probe.validate_state_result(invalid)
